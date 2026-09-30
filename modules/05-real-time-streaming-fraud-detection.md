@@ -2,7 +2,7 @@
 
 *Industry: Card Issuing, Payments & Retail Banking*
 
-## 5.1 Core Theory & Trade-offs
+## 5.1 Ideas & Trade-offs
 
 ### Stream processing fundamentals
 
@@ -22,44 +22,51 @@ flowchart LR
 
 *[Open full-size diagram: Event-time stream processing (SVG)](../diagrams/m5-event-time-stream-processing.svg)*
 
-**Event time vs. processing time.** *Event time* is when the card was swiped. *Processing time* is when your operator sees the event. They diverge because of network delay, retries, mobile devices that were offline, and partition rebalances. Fraud features must be computed on **event time**. Otherwise a burst that arrives late looks spread out, and a backlog replay looks like a burst.
+**In plain words:** stream processing means working on data *while it flows*, one event at a time, instead of waiting to process a big batch later.
 
-**Watermarks** are the stream's estimate that "no events older than T are still coming". They trade **latency against completeness**:
+**Event time vs. processing time:**
 
-- An *aggressive* watermark (small allowed delay) emits results quickly and drops or mishandles more late events.
-- A *conservative* watermark is more complete but slower.
-- Events that arrive after the watermark go to an **allowed-lateness** path, which updates and re-emits the window, or to a side output for correction.
+- *Event time* is when something actually happened, such as when the card was tapped.
+- *Processing time* is when your program sees it.
 
-**Windows:**
+The two differ because of network delays, retries, phones that were offline, and system restarts. Fraud checks must use **event time**. Otherwise a burst that arrives late looks spread out, and a backlog being replayed looks like a burst.
 
-| Window | Shape | Fraud use |
+**Watermarks** are the stream's best guess that "no events older than time T are still coming". They trade **speed against completeness**:
+
+- An *eager* watermark gives quick results but misses more late events.
+- A *patient* watermark is more complete but slower.
+- Events that arrive after the watermark can update the result (**allowed lateness**) or go to a separate "late" output for correction.
+
+**Windows** group events by time:
+
+| Window | Shape | Fraud example |
 |---|---|---|
-| Tumbling | Fixed and non-overlapping (e.g. every 1 min) | Merchant-level dashboards, simple rate alarms |
-| Hopping / sliding | Fixed length that advances by a smaller step (10 min every 30 s) | Velocity: "auths per card in the last 10 minutes" |
-| Session | Closes after a gap of inactivity | Device or online-banking session behaviour, account-takeover patterns |
-| Global + custom trigger | Unbounded, emitted on conditions | Rules like "first transaction in a new country since 90 days" |
+| Tumbling | Fixed blocks that don't overlap (every 1 min) | Merchant dashboards, simple rate alarms |
+| Sliding / hopping | A fixed length that moves forward in small steps (last 10 min, updated every 30 s) | "How many times was this card used in the last 10 minutes?" |
+| Session | Ends after a period of no activity | Online-banking sessions, account-takeover patterns |
+| Global + custom trigger | Never ends. Fires when a condition is met | "First purchase in a new country in 90 days" |
 
-**State and fault tolerance.**
+**Remembering things between events (state):**
 
-- Streaming aggregations are *stateful* (counts per card, last country seen, distinct merchants). The state lives in a keyed state backend such as RocksDB in Flink or Kafka Streams.
-- It is made fault-tolerant by **periodic checkpoints**. Flink uses asynchronous barrier snapshots, a variant of Chandy–Lamport, that record operator state and source offsets consistently.
-- Recovery rewinds sources to the checkpointed offsets and restores state. The *effect* is exactly-once **for state inside the engine**.
+- Counting per card, remembering the last country and so on needs **state**. It's kept in a local database inside the stream engine (such as RocksDB in Flink or Kafka Streams).
+- The engine regularly saves **checkpoints** of that state together with its position in the input.
+- After a crash, it goes back to the checkpoint and continues. The *effect* is "exactly once" **for data inside the engine**.
 
-**Exactly-once, precisely:**
+**What "exactly once" really covers:**
 
-- **Kafka transactions** (idempotent producer + `transactional.id` + `sendOffsetsToTransaction` + consumers reading `read_committed`) make a consume–transform–produce loop atomic: output records and input offsets commit together or not at all.
-- **Flink** extends this to sinks using two-phase-commit sink connectors.
-- **Anything outside that boundary is still at-least-once**: a Redis feature store, a REST call to case management, an SMS alert. The rule from Module 1 applies: make those writes idempotent by event ID.
+- **Kafka transactions** (idempotent producer + `transactional.id` + `sendOffsetsToTransaction` + consumers reading `read_committed`) make "read, process, write" one all-or-nothing step: outputs and input positions are saved together or not at all.
+- **Flink** extends this to some outputs with two-phase commit.
+- **Anything outside that is still "at least once"**: a Redis feature store, a REST call, an SMS. The rule from Module 1 applies: make those writes safe to repeat, using the event ID.
 
-**Kappa vs. Lambda:**
+**Two ways to build the data platform:**
 
 | | Lambda | Kappa |
 |---|---|---|
-| Paths | Batch layer (complete, slow) + speed layer (fast, approximate) | A single streaming path. Reprocess by replaying the log |
-| Cost | Two codebases computing "the same" feature, which *will* drift | One codebase. Replay needs long log retention or a lakehouse source |
-| Modern form | Mostly retired | Streaming + lakehouse (Delta/Iceberg) as replayable history |
+| Paths | A batch path (complete, slow) plus a fast path (quick, approximate) | Only a streaming path. To reprocess, replay the log |
+| Cost | Two codebases computing "the same" number, which *will* drift apart | One codebase. Needs a long log or a data lake to replay from |
+| Today | Mostly replaced | Streaming plus a data lake (Delta/Iceberg) as replayable history |
 
-For fraud, the pragmatic answer is **Kappa for features, with batch for model training and graph analytics**, plus one feature definition compiled to both paths (see training–serving skew below).
+For fraud, the practical answer is **Kappa for features, batch for model training and graph analysis**, with one shared definition for each feature (see "training/serving mismatch" below).
 
 ### Fraud detection architecture: three latency tiers
 
@@ -78,13 +85,13 @@ flowchart LR
 
 *[Open full-size diagram: Three latency tiers of fraud detection (SVG)](../diagrams/m5-three-latency-tiers-of-fraud-detection.svg)*
 
-| Tier | Latency budget | Examples | Where it runs |
+| Tier | Time budget | Examples | Where it runs |
 |---|---|---|---|
-| **Inline (synchronous)** | Tens of ms, inside the card network's authorization timeout | Approve / step-up / decline on a card authorization or instant payment | Scoring service in the auth path |
-| **Near-real-time** | Seconds to minutes | Card-testing attack on a merchant, account-takeover sequences, mule-account inflows, customer alerts | Stream processor → alerts / feature store |
-| **Batch** | Hours to days | Graph analysis of mule rings, model training, AML typologies, back-testing rules | Lakehouse, graph engine |
+| **Inline (while the payment waits)** | Tens of ms, inside the card network's time limit | Approve / extra check / decline a card payment or instant transfer | A scoring service in the payment path |
+| **Near real time** | Seconds to minutes | Attacks on a merchant, account takeover, money-mule deposits, customer alerts | Stream processor → alerts and feature store |
+| **Batch** | Hours to days | Finding mule rings with graph analysis, training models, anti-money-laundering (AML) patterns, testing rules | Data lake, graph engine |
 
-**The central design constraint:** the inline path **cannot wait** for a stream aggregation. It reads **precomputed features** from a low-latency online feature store, and combines them with **request-time features** computed from the authorization itself.
+**The key design limit:** the inline check **can't wait** for the stream to finish counting. It reads **ready-made features** from a fast **online feature store**, and adds features calculated from the payment request itself.
 
 ### Features, and the traps around them
 
@@ -104,22 +111,28 @@ flowchart LR
 
 *[Open full-size diagram: Feature freshness classes (SVG)](../diagrams/m5-feature-freshness-classes.svg)*
 
-- **Velocity:** counts and sums over sliding windows per entity: card, account, device, IP, merchant, and card-plus-merchant pairs.
-- **Distinct counts:** distinct merchants or countries per card in 24 h. At scale, use HyperLogLog with its approximation error stated.
-- **Behavioural baselines:** typical amount, usual merchant categories, usual hours, home country. Expressed as deviations (z-scores), not raw values.
-- **Geo-velocity ("impossible travel"):** the distance between consecutive card-present locations divided by the time between them.
-- **Graph features:** shared devices, shared payees, and fan-in to newly opened accounts (mule signals). Usually computed in batch and published to the online store.
+**Features** are the numbers the model uses to judge a payment:
 
-**Freshness gap.** A card-testing script can fire 50 authorizations in 2 seconds. If your stream processor's end-to-end lag is 1–3 seconds, stream-computed velocity features are *blind* to exactly the burst you care about. **Principal answer:** maintain the *short-window* counters **inline**, as an atomic read-and-increment in the authorization path. Let the stream compute the heavier windows, baselines and cross-entity aggregates.
+- **Velocity:** counts and totals over recent time windows, per card, account, device, IP address, merchant, and card + merchant pair.
+- **Distinct counts:** how many different merchants or countries a card used in 24 h. At scale, use HyperLogLog, an approximate counter, and state its error margin.
+- **Normal behaviour:** typical amount, usual shop types, usual hours, home country. Expressed as "how unusual is this?" rather than raw values.
+- **Impossible travel:** the distance between two in-person purchases divided by the time between them.
+- **Relationship features:** shared devices, shared payees, many new accounts sending money to one place (mule signs). Usually calculated in batch and copied to the online store.
 
-**Training–serving skew.** A feature computed one way in Python notebooks for training and another way in the stream for serving will silently diverge, and model performance will quietly decay. Mitigations:
+**The freshness gap.** A bot testing stolen cards can make 50 payments in 2 seconds. If the stream processor is 1–3 seconds behind, its counters **can't see** exactly the burst you care about. **The fix:** keep the *short-window* counters **inside the payment path**, as one atomic "add and read" step. Let the stream handle the heavier features.
 
-- Define features once, in a feature platform or a shared library, and generate both the offline and online computations from that definition.
-- Log the **features as served** at decision time, and train on those logs.
+**Training/serving mismatch.** If a feature is calculated one way in the notebook used for training and another way in the live stream, the two slowly drift apart and the model quietly gets worse. Fixes:
 
-**Point-in-time correctness.** Training joins must use feature values *as they were at the event's timestamp*. Joining today's "customer risk score" onto last year's transactions leaks the future into training, producing a model that looks great offline and fails in production.
+- Define each feature **once** (in a feature platform or a shared library) and generate both versions from that definition.
+- **Save the features exactly as used** at decision time, and train on those.
 
-**Labels arrive late and biased.** Chargebacks and fraud confirmations arrive 30–90+ days after the transaction. Declined transactions have *no* outcome label at all, because you blocked them, which is selection bias. Mitigations: explicit label-maturity windows, a small randomized holdout that is scored but not acted upon (where regulation and risk appetite allow), and monitoring of score distributions for drift instead of waiting for labels.
+**Point-in-time correctness.** When building training data, use feature values *as they were at the time of each payment*. Joining today's "customer risk score" onto last year's payments lets the model peek into the future. It looks great in testing and fails in real use.
+
+**Labels arrive late and are biased.** A *label* is the answer "this was fraud" or "this was fine".
+
+- Chargebacks and fraud reports arrive 30–90+ days after the payment.
+- Payments you declined **never** get a label, because you stopped them (this is called *selection bias*).
+- Fixes: wait until labels are mature, keep a small random group that's scored but not acted on (only if rules and risk appetite allow), and watch for changes in score patterns instead of waiting for labels.
 
 ### Decisioning: rules + model + cost
 
@@ -143,18 +156,20 @@ flowchart LR
 
 *[Open full-size diagram: Fraud decision policy (SVG)](../diagrams/m5-fraud-decision-policy.svg)*
 
-- **Rules** are explainable, instantly deployable and auditable. They handle known patterns, regulatory hard stops (sanctions hits) and emergency response ("block MCC 7995 from country X for 2 hours").
-- **Models** (gradient-boosted trees are still the workhorse, with sequence and graph models layered on) rank risk across hundreds of weak signals.
-- **Decision policy** maps `(score, rules fired, amount, customer segment)` to *approve*, *step-up* (3-D Secure, OTP, in-app confirmation), *decline* or *queue for review*. Choose thresholds on **expected cost**, not accuracy: `fraud_loss × P(fraud)` against `friction_cost × P(legit)`, where friction cost includes abandoned purchases and churned customers. Fraud is heavily imbalanced, so evaluate with precision–recall at operating points, not ROC-AUC alone.
-- **Reason codes** accompany every decline or step-up, for customer service, disputes and model governance.
+- **Rules** are easy to explain, quick to change and easy to audit. They handle known patterns, legal hard stops (sanctions matches), and emergencies ("block gambling merchants from country X for 2 hours").
+- **Models** (gradient-boosted trees are still the workhorse, with sequence and graph models added on top) rank risk using hundreds of small signals.
+- **The decision policy** combines score, rules, amount and customer type into: *approve*, *extra check* (3-D Secure, a one-time code, confirming in the app), *decline*, or *send for review*.
+  - Pick thresholds by **expected cost**, not accuracy: `fraud loss × chance of fraud` compared with `friction cost × chance it's legitimate`. Friction cost includes lost sales and customers who leave.
+  - Fraud is rare, so measure precision and recall at the threshold you'll actually use, not only overall scores such as ROC-AUC.
+- **Reason codes** go with every decline or extra check, for customer service, disputes and model reviews.
 
-**Failure policy.** If the scoring service is down, you must not stop authorizing cards. The standard approach is **fail-open to stand-in rules**: a static ruleset with conservative amount limits evaluated locally in the authorization service, plus an alert. Fail-closed is reserved for narrow cases such as sanctions screening. Decide this with the business *in advance* and test it.
+**When the scoring service fails.** You must not stop approving card payments. The usual approach is **"let it through" with backup rules**: a simple, strict rule set that runs locally in the payment service, with lower amount limits and an alert. Blocking everything is only for narrow cases such as sanctions screening. Agree this with the business *before* it happens, and test it.
 
-**AML is a different problem.** Transaction monitoring for anti-money-laundering has longer horizons (days to months), typologies such as structuring and layering, case management and regulatory reporting (in Canada, suspicious-transaction reports to FINTRAC). It shares the streaming and feature infrastructure but has its own models, audit and governance requirements. Don't let a fraud platform be the AML system by accident.
+**AML is a different problem.** Anti-money-laundering monitoring looks over days to months, at patterns like splitting deposits to stay under limits. It involves case management and reports to regulators (in Canada, suspicious-transaction reports to FINTRAC). It can share the streaming and feature tools, but it needs its own models, audits and governance. Don't let a fraud system become the AML system by accident.
 
-## 5.2 Python in Practice
+## 5.2 Python
 
-### Inline scoring service: deadline budget, idempotent inline velocity, stand-in fallback
+### Inline scoring: time budget, safe-to-repeat counters, backup rules
 
 ```python
 import asyncio
@@ -263,13 +278,13 @@ async def score(req: AuthRequest) -> dict:
             "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
 ```
 
-Design notes:
+Notes on the design:
 
-- The thresholds shown are placeholders. Real thresholds come from expected-cost analysis per segment and are **configuration, versioned and audited**, not code constants.
-- A sorted set per *merchant* would be too heavy for merchants with thousands of authorizations per second. Use bucketed counters (one key per second, summed over the window) for high-volume entities.
-- The decision event (request, features as served, score, decision, model version) is published asynchronously for case management, monitoring and training. Losing it must not block the authorization, so use a local durable buffer.
+- The thresholds shown are examples. Real ones come from cost analysis per customer group, and are **settings that are versioned and audited**, not constants in code.
+- A sorted set per *merchant* is too heavy for merchants with thousands of payments per second. For those, use one counter per second and add up the last N counters.
+- The decision record (request, features used, score, decision, model version) is published in the background for case management, monitoring and training. Losing it must not block the payment, so buffer it locally on disk.
 
-### Near-real-time feature pipeline: an exactly-once Kafka transform
+### Near-real-time features: an exactly-once Kafka step
 
 ```python
 import json
@@ -326,37 +341,44 @@ while True:
 
 Caveats:
 
-- `offsets` should hold the *highest* offset per partition. The list above works because the broker takes the last value per partition, but deduplicating it is cleaner.
-- A separate sink consumer writes `card-features` to the online feature store (Redis, Cosmos DB) with **idempotent upserts keyed by entity and event version**. That hop is outside the Kafka transaction.
-- Check that your broker supports Kafka transactions. Apache Kafka, Confluent and MSK do. On Azure, confirm the current Event Hubs Kafka-transaction support for your tier before relying on it.
-- For richer windowing (watermarks, session windows, allowed lateness) in Python, use **PyFlink**, or a Python-native engine such as Bytewax or Quix Streams. Hand-rolled windowing in a consumer loop is where subtle event-time bugs live.
+- `offsets` should contain the *highest* offset per partition. The list above works because Kafka keeps the last value for each partition, but removing duplicates first is cleaner.
+- A separate consumer copies `card-features` into the online feature store (Redis, Cosmos DB) with **upserts keyed by entity and version**, so repeats are harmless. That step is outside the Kafka transaction.
+- Check that your broker supports Kafka transactions. Apache Kafka, Confluent and MSK do. On Azure, check current Event Hubs support for Kafka transactions on your tier before relying on it.
+- For proper windows (watermarks, session windows, late data) in Python, use **PyFlink**, Bytewax or Quix Streams. Home-made windowing inside a consumer loop is where subtle time bugs hide.
 
 ## 5.3 Case Study: Real-Time Card Fraud for a Card Issuer
 
-**Scenario:** an issuer with 30M active cards. 5,000 authorizations/s on average and 20,000/s at peak (Black Friday, the holiday season). The scoring decision has a p99 budget of ~30 ms, inside a network authorization timeout measured in seconds but shared with many other hops. Key threats: **card testing** (bots validating stolen card numbers with small authorizations at weak merchants), account takeover followed by card-not-present spending, and cross-border counterfeit.
+**Scenario:** a card issuer with 30 million active cards. There are 5,000 card payments per second on average and 20,000 per second at peak (Black Friday, holidays). The scoring decision gets ~30 ms for 99% of payments, because the card network allows a few seconds in total but many other steps share that time. The main threats:
 
-### Capacity math
+- **card testing:** bots checking stolen card numbers with small payments at weak merchants;
+- **account takeover** followed by online spending;
+- **cloned cards** used abroad.
 
-| Quantity | Estimate |
+### Rough numbers
+
+| What | Estimate |
 |---|---|
-| Inline Redis operations | ~3 per auth (two velocity scripts + one feature hash) → **60k ops/s at peak**. A small clustered cache handles this. The concern is p99, not throughput |
-| Online feature store size | 30M cards × ~40 features × ~16 B ≈ 20 GB, plus merchant, device and IP entities → tens of GB in memory |
-| Stream throughput | 20k events/s × ~1.5 KB (auth plus enrichment) ≈ 30 MB/s into the stream processor |
-| Decision log | ~400M decisions/day × ~2 KB ≈ **0.8 TB/day**. It is the training set, so keep it in the lakehouse |
-| Freshness SLO | Inline short-window counters: **0 lag** (updated in the path). Stream features: p99 under 2 s. Batch graph features: daily |
+| Redis calls in the payment path | ~3 per payment → **60,000 per second at peak**. A small Redis cluster handles that. The concern is the slowest 1%, not total throughput |
+| Online feature store size | 30M cards × ~40 features × ~16 bytes ≈ 20 GB, plus merchant, device and IP data → tens of GB in memory |
+| Stream volume | 20,000 events/s × ~1.5 KB ≈ 30 MB/s into the stream processor |
+| Decision log | ~400M decisions/day × ~2 KB ≈ **0.8 TB/day**. This is the training data, so keep it in the data lake |
+| Freshness targets | Short-window counters in the payment path: **no delay**. Stream features: 99% within 2 s. Batch relationship features: daily |
 
-### Architecture decisions
+### Design decisions
 
-- **Two feature freshness classes, deliberately.** Short-window velocity counters update inline, which catches card-testing bursts. Everything expensive (24 h windows, baselines, distinct counts, merchant compromise scores) comes from the stream.
-- **A merchant-level detector for card testing.** The signal is *many distinct cards* doing *small authorizations* at *one merchant or terminal*, with a high decline ratio. A 1-minute hopping window per merchant publishes a `merchant_under_attack` flag. The inline path reads it, and every card at that merchant gets stricter thresholds within seconds.
-- **The model registry and shadow scoring.** New models run in **shadow mode**: scored on live traffic, logged, not acted upon. They are promoted only after they outperform the champion at the chosen operating point. This is a parallel run (Module 6) applied to models.
-- **Case management and feedback.** Review-queue outcomes, customer confirmations ("was this you?") and chargebacks flow back as labels, joined point-in-time with the features as served.
-- **Explainability and governance.** Reason codes on every adverse decision. A model risk-management trail: data lineage, validation reports, versioned thresholds, and a record of who changed what.
-- **Failure policy.** Scoring unavailable means stand-in rules with lower limits. The feature store unavailable means stand-in rules. The stream processor lagging means inline counters still work, with an alert on the freshness SLO.
+- **Two freshness levels, on purpose.** Short-window counters are updated in the payment path and catch card-testing bursts. Everything expensive (24 h windows, normal behaviour, distinct counts, merchant risk) comes from the stream.
+- **A merchant-level detector for card testing.** The sign is *many different cards* making *small payments* at *one merchant*, with many declines. A 1-minute sliding window per merchant sets a `merchant_under_attack` flag. The payment path reads it, so every card at that merchant faces stricter limits within seconds.
+- **Testing new models safely.** New models first run in **shadow mode**: they score live payments and are logged, but their decisions aren't used. They replace the current model only if they do better at the chosen threshold. This is the parallel-run idea from Module 6, applied to models.
+- **Learning from outcomes.** Review results, customer answers ("was this you?") and chargebacks flow back as labels, joined to the features as they were at the time.
+- **Explaining decisions.** Every declined payment gets reason codes. There is a model review trail: data history, test reports, versioned thresholds, and who changed what.
+- **When parts fail:**
+  - Scoring down → backup rules with lower limits.
+  - Feature store down → backup rules.
+  - Stream processor behind → in-path counters still work, and an alert fires on the freshness target.
 
-**Azure mapping:** Event Hubs (Kafka endpoint) for the event backbone. Azure Stream Analytics for simple windows, or Flink on AKS / HDInsight on AKS for stateful features. Azure Cache for Redis Enterprise or Cosmos DB as the online feature store. Azure Machine Learning for the registry and training. Fabric or Databricks as the lakehouse for the decision log and batch features.
+**Azure services:** Event Hubs (Kafka API) for events. Azure Stream Analytics for simple windows, or Flink on AKS for complex state. Azure Cache for Redis Enterprise or Cosmos DB as the online feature store. Azure Machine Learning for the model registry and training. Fabric or Databricks as the data lake for the decision log and batch features.
 
-## 5.4 Mermaid: Real-Time Fraud Architecture
+## 5.4 Diagram: Real-Time Fraud Architecture
 
 ```mermaid
 flowchart LR
@@ -395,34 +417,34 @@ flowchart LR
 
 *[Open full-size diagram: Real-time fraud architecture (SVG)](../diagrams/m5-real-time-fraud-architecture.svg)*
 
-## 5.5 Animation Blueprint: Catching a Card-Testing Attack Before the Stream Does
+## 5.5 Animation Plan: Catching a Card-Testing Attack Before the Stream Does
 
-**Scene setup:**
+**Scene:**
 
-- **Top:** a horizontal event-time axis with a moving "now" cursor.
-- **Middle-left:** a merchant storefront icon labelled *Merchant M-481*.
-- **Middle-right:** two counter panels side by side: *Inline counter (0 lag)* and *Stream counter (1.5 s lag)*.
-- **Bottom:** a decision gauge with three zones: green *approve*, amber *step-up*, red *decline*.
-- A watermark marker (a dashed vertical line) trails the "now" cursor on the axis.
+- **Top:** a timeline with a moving "now" marker.
+- **Middle left:** a shop icon labelled *Merchant M-481*.
+- **Middle right:** two counters side by side: *In-path counter (no delay)* and *Stream counter (1.5 s behind)*.
+- **Bottom:** a decision meter with three zones: green *approve*, amber *extra check* and red *decline*.
+- A dashed watermark line follows behind the "now" marker.
 
-| Time | Beat | Visual | Manim primitives |
+| Time | Step | What you see | Manim tools |
 |---|---|---|---|
-| 0:00–0:04 | **Normal traffic** | Sparse coloured dots (distinct cards) arrive at the merchant: a few per second, varied amounts. Both counters sit low and agree | `Dot` spawns on a timer, `DecimalNumber` |
-| 0:04–0:07 | **Attack starts** | A bot icon appears. A dense stream of *tiny* ($1.00–$2.00) authorizations from many *different* card colours fires at the merchant | `LaggedStart` of fast `MoveAlongPath` |
-| 0:07–0:12 | **The freshness gap** | The inline counter jumps with every event. The stream counter keeps showing old values, and a shaded band labelled *processing lag* stretches between event time and the stream's view. Caption: *Stream features are 1.5 s behind the burst* | `always_redraw` band, two counters with different updaters |
-| 0:12–0:15 | **Inline catch** | For a card hit repeatedly, its 10-minute inline velocity crosses 8. The gauge needle swings into amber: *STEP-UP*. A small 3-D Secure prompt icon appears | `Rotate(needle)`, `FadeIn` |
-| 0:15–0:20 | **Stream catches up** | The watermark passes the burst. A 1-minute hopping window above the axis fills: *distinct cards 212, avg amount $1.40, decline ratio 71%*. The window closes and emits a red `merchant_under_attack` flag that flies to the feature store | `Rectangle` window sliding, `Transform`, `MoveToTarget` |
-| 0:20–0:24 | **Merchant-wide tightening** | Every new authorization at M-481 now reads the flag. The gauge threshold marker slides left, and the bot's next attempts land in red: *DECLINE* | `threshold.animate.shift(LEFT)`, red `Flash` |
-| 0:24–0:29 | **Late event** | A dot with an older event time arrives *behind* the watermark (an offline terminal). It routes to a side lane labelled *allowed lateness → window updated*. The closed window re-opens briefly and its count ticks up by one | `ArcBetweenPoints` path, `Indicate` |
-| 0:29–0:33 | **Recap** | Two columns: *Inline: fast, narrow, per-card* and *Stream: complete, cross-entity, slightly late*. Caption: *You need both* | `VGroup.arrange(RIGHT)` |
+| 0:00–0:04 | **Normal traffic** | A few coloured dots (different cards) arrive at the shop each second, with varied amounts. Both counters are low and agree | Dots spawned on a timer, `DecimalNumber` |
+| 0:04–0:07 | **Attack starts** | A bot icon appears and fires a dense stream of *tiny* ($1–2) payments from many *different* cards | Fast `LaggedStart` of paths |
+| 0:07–0:12 | **The freshness gap** | The in-path counter jumps with every payment. The stream counter still shows old numbers, and a shaded band labelled *processing delay* stretches between them. Caption: *Stream features are 1.5 s behind the burst* | `always_redraw` band, two counters |
+| 0:12–0:15 | **Caught in the path** | For a card used again and again, its 10-minute counter passes 8. The meter swings to amber: *EXTRA CHECK*. A 3-D Secure prompt icon appears | Rotating needle, `FadeIn` |
+| 0:15–0:20 | **The stream catches up** | The watermark passes the burst. A 1-minute window above the timeline fills: *212 different cards, average $1.40, 71% declined*. The window closes and sends a red `merchant_under_attack` flag to the feature store | Sliding rectangle, `Transform`, `MoveToTarget` |
+| 0:20–0:24 | **Merchant-wide tightening** | Every new payment at M-481 now reads the flag. The threshold marker slides left, and the bot's next tries land in red: *DECLINE* | Threshold shift, red `Flash` |
+| 0:24–0:29 | **Late event** | A dot with an older time arrives *after* the watermark (a card terminal that was offline). It goes to a side lane: *late data → window updated*. The closed window briefly reopens and its count goes up by one | Curved path, `Indicate` |
+| 0:29–0:33 | **Summary** | Two columns: *In-path: fast, narrow, per card* and *Stream: complete, cross-merchant, slightly late*. Caption: *You need both* | `VGroup.arrange` |
 
-## 5.6 Staff-level Review Questions
+## 5.6 Review Questions
 
-- Which features does the inline path read, and what is each one's worst-case staleness at p99?
-- How are the same feature definitions guaranteed to match between training and serving?
-- What happens to authorizations, precisely, when the scoring service is unavailable, and when was that last tested?
-- How are decision thresholds chosen, versioned and approved, and who can change them in an emergency?
-- How does the platform measure performance on transactions that were declined and therefore never got a label?
+- Which features does the payment path read, and how out of date can each one be in the worst 1% of cases?
+- How do you make sure a feature is calculated the same way in training and in production?
+- Exactly what happens to payments when the scoring service is down, and when did you last test it?
+- How are thresholds chosen, versioned and approved, and who can change them in an emergency?
+- How do you measure how the model does on payments you declined, which never get a label?
 
 ---
 

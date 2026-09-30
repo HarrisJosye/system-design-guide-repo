@@ -2,7 +2,7 @@
 
 *Industry: Global SaaS & IoT*
 
-## 3.1 Core Theory & Trade-offs
+## 3.1 Ideas & Trade-offs
 
 ### Consensus: Raft and Paxos
 
@@ -24,25 +24,33 @@ flowchart LR
 
 *[Open full-size diagram: Raft log replication and commit (SVG)](../diagrams/m3-raft-log-replication-and-commit.svg)*
 
-Consensus lets a group of nodes agree on a single ordered log despite crash failures (not Byzantine ones). The **FLP result** says no deterministic protocol can guarantee termination in a fully asynchronous network if even one node may crash. Practical protocols therefore guarantee **safety always** and **liveness only when the network behaves** (partial synchrony, enforced with timeouts).
+**In plain words:** consensus lets a group of machines agree on the same ordered list of changes (a *log*), even if some machines crash. It doesn't handle machines that lie on purpose (that's a different, harder problem).
 
-**Raft in one page:**
+A famous result (**FLP**) shows that no method can *guarantee* agreement will finish if the network can be slow without limit and even one machine may crash. So real systems promise two things: **never agree on something wrong**, and **finish when the network behaves reasonably**. Timeouts decide when to try again.
 
-- **Roles:** follower, candidate, leader. **Terms** are a monotonically increasing logical clock. Any message carrying a higher term forces the receiver to step down and adopt that term.
-- **Election:** a follower that hears no heartbeat within a *randomized* election timeout (150–300 ms in the paper, often 1 s or more in production and WAN deployments) increments its term, votes for itself, and sends `RequestVote`. A node grants at most one vote per term, and **only to a candidate whose log is at least as up-to-date as its own** (compare last log term, then last log index). This *election restriction* guarantees that every elected leader already holds every committed entry.
-- **Replication:** the leader sends `AppendEntries` with `(prevLogIndex, prevLogTerm)`. A follower rejects the call if its log doesn't match there, and the leader backs up until the logs agree, overwriting divergent follower entries.
-- **Commit:** an entry is committed once it is stored on a majority **and** it belongs to the leader's current term. Older-term entries commit indirectly. This is the subtle "Figure 8" case in the Raft paper, and it is why new leaders append a no-op entry immediately.
-- **Quorums:** `n = 2f + 1` tolerates `f` failures. Three nodes tolerate one failure and five tolerate two. **Even cluster sizes add cost without adding tolerance.**
-- **Latency:** commit time equals the leader's fsync plus the RTT to the fastest majority. With five voters across three regions, every write pays roughly the RTT to the second-nearest region.
-- **Production extensions:**
-  - **Pre-vote** stops a node rejoining after a partition from inflating terms and disrupting a healthy leader.
-  - **ReadIndex or leader leases** give linearizable reads. Without them, a deposed leader in a minority partition can serve stale reads.
-  - **Learners** are non-voting replicas.
-  - **Joint consensus** allows safe membership changes.
+**Raft on one page:**
 
-**Raft vs. Paxos:** Multi-Paxos and Raft are equivalent in power. Raft is a strong-leader design optimized for understandability. Leaderless variants such as EPaxos reduce WAN latency at considerable complexity. **Don't implement consensus.** Use etcd, ZooKeeper (ZAB), Consul, or systems that embed Raft (CockroachDB, TiKV, Kafka KRaft).
+- **Roles:** each machine is a *follower*, a *candidate* or the *leader*.
+- **Terms** are election rounds, numbered 1, 2, 3 and so on. A machine that sees a message with a higher term steps down and adopts that term.
+- **Elections:** if a follower hears nothing from the leader for a *random* timeout (150–300 ms in the Raft paper, often 1 s or more in real deployments), it:
+  1. increases the term;
+  2. votes for itself;
+  3. asks the others for votes (`RequestVote`).
 
-**Split brain.** Raft guarantees at most one leader *can commit* per term. It does **not** stop a deposed leader from *believing* it is still leader, or stop *application-level* split brain, such as two regions each accepting writes for the same device. The fix is always the same: attach an **epoch or term to every write**, and have the storage layer reject writes from lower epochs.
+  Each machine votes at most once per term, and **only for a candidate whose log is at least as up to date as its own**. That rule guarantees a new leader already has every agreed change.
+- **Copying changes:** the leader sends new entries to followers (`AppendEntries`), including the position and term of the entry just before them. If a follower's log doesn't match there, it says no, and the leader steps back until the logs match. Followers' extra, unconfirmed entries are overwritten.
+- **Committing:** an entry is final ("committed") once a **majority** has stored it **and** it's from the leader's current term. Entries from older terms become final indirectly. This is a subtle case in the Raft paper, and it's why a new leader immediately adds an empty entry.
+- **Majorities:** with `2f + 1` machines, the group survives `f` failures. 3 machines survive 1 failure, and 5 survive 2. **An even number adds cost but no extra safety.**
+- **Speed:** each commit takes the leader's disk write plus the round trip to the fastest majority. With 5 machines across 3 regions, every write waits on a round trip to another region.
+- **Extras used in production:**
+  - **Pre-vote:** a machine returning after a network split checks first whether it could win, instead of starting pointless elections.
+  - **Leader leases / ReadIndex:** stop a leader that was cut off in a minority group from serving old data.
+  - **Learners:** copies that receive data but don't vote.
+  - **Joint consensus:** a safe way to change which machines are in the group.
+
+**Raft vs. Paxos:** they can do the same things. Raft is easier to understand and has one strong leader. Paxos variants (such as EPaxos) can have no leader, which can be faster across regions but is much more complex. **Don't build consensus yourself.** Use etcd, ZooKeeper or Consul, or databases with Raft built in (CockroachDB, TiKV, Kafka's KRaft).
+
+**Split brain.** Raft guarantees that at most one leader can *commit* in each term. It does **not** stop an old leader from *thinking* it's still in charge. It also doesn't stop split brain in *your application*, for example two regions each accepting changes for the same device. The fix is the same everywhere: **attach an epoch or term number to every write**, and have storage reject writes carrying an older number.
 
 ### Gossip protocols
 
@@ -65,14 +73,16 @@ flowchart LR
 
 *[Open full-size diagram: SWIM failure detection (SVG)](../diagrams/m3-swim-failure-detection.svg)*
 
-**SWIM-style membership:**
+**In plain words:** machines spread news the way people spread gossip. Each one tells a few random others, and soon everyone knows.
 
-- Each protocol period, a node pings one random peer. If there is no ack, it asks *k* other peers to ping that node indirectly (`ping-req`). If there is still no response, the node is marked *suspect* and then *dead* after a timeout.
-- Membership updates **piggyback** on pings, so dissemination takes `O(log N)` rounds with constant per-node load.
+**SWIM, the most common version, for "who's alive?":**
 
-**Trade-offs:** gossip is probabilistic and eventually consistent, and false positives rise under GC pauses or network jitter. The **phi-accrual detector** (Cassandra, Akka) outputs a continuous suspicion level instead of a binary verdict, letting each subsystem choose its own threshold.
+- Every so often, each machine pings one random machine. If there's no answer, it asks a few *other* machines to ping it (`ping-req`). If there's still no answer, the machine is marked *suspect*, and then *dead* after a timeout.
+- News about who joined or left **rides along on these pings**, so everyone hears it within `O(log N)` rounds, and each machine does only a small, fixed amount of work.
 
-**Rule of thumb:** use gossip for *who is alive and what they advertise*, and consensus for *decisions that must not diverge*. Consul does exactly this: gossip (Serf/memberlist) for membership, and Raft for the service catalog.
+**Trade-offs:** gossip is fast and cheap, but not exact, and news arrives "eventually". Pauses and network hiccups cause false alarms. The **phi-accrual detector** (used by Cassandra and Akka) gives a "suspicion level" instead of yes/no, so each part of the system can choose its own threshold.
+
+**Rule of thumb:** use gossip for *who's alive and what they offer*, and consensus for *decisions everyone must agree on*. Consul uses both: gossip for membership, and Raft for its service catalog.
 
 ### Rate limiting: token bucket vs. leaky bucket
 
@@ -97,22 +107,24 @@ flowchart LR
 
 *[Open full-size diagram: Token bucket vs leaky bucket (SVG)](../diagrams/m3-token-bucket-vs-leaky-bucket.svg)*
 
-| Algorithm | Behaviour | Burst handling | State | Typical use |
+**In plain words:** rate limiting stops any one client from sending too many requests.
+
+| Method | How it behaves | Bursts | Memory needed | Typical use |
 |---|---|---|---|---|
-| **Token bucket** | Bucket of capacity B refills at r tokens/s. A request spends tokens | **Allows bursts** up to B. Long-run rate is r | 2 numbers | API quotas, per-device limits |
-| **Leaky bucket (queue)** | Requests enter a queue of size Q, drained at a constant r | **Smooths bursts** into a steady output, and adds queueing delay | Queue | Protecting a fragile downstream that needs a steady rate |
-| Leaky bucket (meter) / GCRA | Tracks a "theoretical arrival time" | Mathematically equivalent to a token bucket | 1 number | Telecom, efficient Redis limiters |
-| Fixed window | Counter per window | Up to 2× bursts at window edges | 1 counter | Coarse quotas |
-| Sliding window log | Timestamps of every request | Exact | O(requests) | Low-volume, high-precision cases |
-| Sliding window counter | Weighted blend of two windows | Close approximation | 2 counters | A good general default |
+| **Token bucket** | A bucket holds up to B tokens and refills at r per second. Each request uses a token | **Allows bursts** up to B. Averages r | 2 numbers | API limits, per-device limits |
+| **Leaky bucket (queue)** | Requests wait in a queue of size Q and leave at a steady rate r | **Smooths bursts** into a steady flow. Adds waiting time | A queue | Protecting a fragile system that needs a steady pace |
+| Leaky bucket (counter) / GCRA | Tracks when the next request is allowed | Same result as a token bucket | 1 number | Telecoms, efficient Redis limiters |
+| Fixed window | Count per minute | Up to 2× bursts where two windows meet | 1 counter | Rough limits |
+| Sliding window log | Stores every request's time | Exact | Grows with traffic | Low traffic where precision matters |
+| Sliding window counter | Blends two windows | Close enough | 2 counters | A good general default |
 
-**Distributed rate limiting has three designs:**
+**Rate limiting across many servers:**
 
-1. **Centralized.** A Redis Lua script is atomic and accurate, but adds about a millisecond of RTT and makes Redis a dependency. Decide explicitly whether to **fail open** (protecting a backend) or **fail closed** (billing or abuse quotas).
-2. **Local buckets.** Each of N instances enforces r/N locally. This is fast and inaccurate under uneven load balancing.
-3. **Hybrid.** Local buckets asynchronously lease quota from a central store.
+1. **Central counter** in Redis with a Lua script: exact and atomic, but adds about 1 ms per request, and Redis becomes something you depend on. Decide what happens if Redis is down: **let traffic through** (when protecting a backend) or **block it** (for billing or abuse limits).
+2. **Local limits:** each of N servers allows r/N. Fast, but inaccurate if traffic isn't spread evenly.
+3. **Hybrid:** each server keeps a local bucket and occasionally borrows allowance from a central store.
 
-**Rate limiting is not load shedding.** Rate limits enforce *per-client fairness*. Load shedding is *server self-preservation* driven by the server's own health signals (in-flight concurrency, queue wait time). Adaptive concurrency limits using AIMD or a latency gradient catch overloads that static rate limits miss.
+**Rate limiting is not load shedding.** Rate limits keep things *fair between clients*. Load shedding is a server *protecting itself* based on its own health (how many requests are in flight, how long they've waited). Adaptive limits catch overloads that fixed rate limits miss.
 
 ### Circuit breakers
 
@@ -129,21 +141,23 @@ flowchart LR
 
 *[Open full-size diagram: Layered resiliency around one dependency call (SVG)](../diagrams/m3-layered-resiliency-around-one-dependency-call.svg)*
 
-A breaker moves through three states:
+**In plain words:** like the electrical breaker in your house. If a service you call keeps failing, stop calling it for a while, so it can recover and your own app doesn't hang.
 
-- **Closed:** calls flow, and outcomes are recorded in a rolling window.
-- **Open:** calls fail fast for a cool-down period, and the caller serves a fallback.
-- **Half-open:** a limited number of probe calls are admitted. Enough successes close the breaker, and any failure re-opens it.
+A breaker has three states:
 
-Design details that decide whether a breaker helps or hurts:
+- **Closed** (normal): calls go through, and results are counted.
+- **Open** (tripped): calls fail immediately for a cool-down period, and you use a fallback.
+- **Half-open** (testing): a few test calls are allowed through. If they succeed, the breaker closes. If one fails, it opens again.
 
-- **Trip on failure *rate* with a minimum call volume.** One failure out of one call is not an outage.
-- **Count slow calls as failures.** A dependency that answers in 9 s is down for practical purposes.
-- **Classify errors.** 5xx responses and timeouts are failures. 4xx responses are the *caller's* bug and must not trip the breaker.
-- **Choose granularity per dependency and per endpoint or shard.** One global breaker in front of a sharded database trips everything when one shard fails.
-- **Timeouts are a prerequisite.** Without a deadline, a hung call never "fails", so the breaker never opens.
-- **Combine with bulkheads** (separate connection pools per dependency) so one slow dependency cannot exhaust every worker.
-- **Retries go *outside* the breaker, with backoff, full jitter and a retry budget.** Three layers retrying three times each is **27× amplification** during an outage. Cap retries at around 10% of traffic.
+Details that decide whether a breaker helps or hurts:
+
+- **Trip on a failure *rate*, with a minimum number of calls.** One failure out of one call isn't an outage.
+- **Count slow calls as failures.** A service that answers in 9 seconds is effectively down.
+- **Only count the right errors.** 5xx errors and timeouts are the other service's fault. 4xx errors are *your* bug and shouldn't trip the breaker.
+- **Use one breaker per service and endpoint (or shard).** A single breaker for a whole sharded database trips everything when one shard fails.
+- **You need timeouts first.** Without a timeout, a hung call never "fails", so the breaker never opens.
+- **Use separate connection pools per service (bulkheads)**, so one slow service can't use up all your workers.
+- **Put retries *outside* the breaker**, with backoff, jitter and a budget. If three layers each retry three times, one failed request becomes **27** requests during an outage. Cap retries at about 10% of traffic.
 
 ### Graceful degradation
 
@@ -164,20 +178,22 @@ flowchart LR
 
 *[Open full-size diagram: Degradation ladder (SVG)](../diagrams/m3-degradation-ladder.svg)*
 
-Design an explicit **degradation ladder** with product owners *before* the incident:
+**In plain words:** when things get bad, keep the most important features working and switch off the rest, instead of failing completely.
 
-| Level | Behaviour |
+Plan the steps with the product team **before** anything breaks:
+
+| Level | What happens |
 |---|---|
-| L0 Full | All features |
-| L1 Reduced | Serve stale caches (stale-while-revalidate). Disable recommendations, rich analytics and non-critical enrichment |
-| L2 Core only | Critical paths only. Low-priority traffic is shed by priority class |
-| L3 Static | Static fallback responses, queue-and-acknowledge writes |
+| L0 Full | Everything works |
+| L1 Reduced | Serve older cached data. Turn off recommendations, rich reports and extras |
+| L2 Core only | Only critical features work. Low-priority traffic is turned away |
+| L3 Static | Show simple fixed responses. Accept writes into a queue and confirm them later |
 
-Priority-based shedding needs every request tagged with a criticality class at the edge. Health checks and the control plane come first, safety alarms next, and bulk telemetry last.
+To turn away the least important work first, every request needs a priority label from the start. Health checks and control traffic come first, safety alarms next, and bulk data last.
 
-## 3.2 Python in Practice: Resiliency Patterns
+## 3.2 Python: Resiliency Patterns
 
-### Retries with `tenacity`: retry only what's retryable
+### Retries with `tenacity`: only retry what's worth retrying
 
 ```python
 import httpx
@@ -206,7 +222,7 @@ async def push_device_config(client: httpx.AsyncClient, device_id: str, cfg: dic
     r.raise_for_status()
 ```
 
-`tenacity` is a retry library, not a circuit breaker. Libraries such as `pybreaker` and `aiobreaker` exist, but a breaker is small enough that owning it pays off in observability and correct async semantics.
+`tenacity` handles retries, but it's not a circuit breaker. Libraries such as `pybreaker` and `aiobreaker` exist, but a breaker is small enough that writing your own gives you better monitoring and correct async behaviour.
 
 ### A custom async circuit breaker
 
@@ -314,7 +330,7 @@ class CircuitBreaker:
             await self._record(probe, failed=False)
 ```
 
-Usage, with a timeout inside the breaker so slow calls count as failures, and a degradation path when it opens:
+How to use it, with a timeout inside the breaker so slow calls count as failures, and a fallback when it's open:
 
 ```python
 tsdb_breaker = CircuitBreaker(
@@ -332,9 +348,9 @@ async def write_batch(batch: list[dict]) -> None:
         await spill_to_local_queue(batch)   # graceful degradation: durable buffer, replay later
 ```
 
-Each process keeps its own breaker state. Across 200 pods, every pod learns about failures independently, which is usually desirable because each sees its own network path. Sharing state through Redis adds a dependency to the very component meant to survive dependency failures.
+Each server process keeps its own breaker. With 200 servers, each learns about failures on its own, which is usually fine because each sees its own network path. Sharing the breaker state through Redis would add a dependency to the very part that's meant to survive dependency failures.
 
-### Atomic distributed token bucket (Redis + Lua)
+### A rate limiter shared by all servers (Redis + Lua token bucket)
 
 ```python
 import redis.asyncio as redis
@@ -386,47 +402,52 @@ flowchart LR
 
 *[Open full-size diagram: IoT - AP data plane, CP control plane (SVG)](../diagrams/m3-iot-ap-data-plane-cp-control-plane.svg)*
 
-**Scenario:** 8M industrial sensors and smart meters across North America, the EU and APAC. Each device sends a heartbeat every 10 s and a telemetry batch every 60 s, and receives configuration and firmware commands. EU device data must stay in the EU. Inter-region links fail occasionally, and regional data centres have experienced partitions in which both sides stay reachable by devices. That is the definition of a split-brain risk.
+**Scenario:** 8 million industrial sensors and smart meters across North America, the EU and Asia-Pacific. Each device sends a "still alive" message (heartbeat) every 10 seconds and a batch of readings every 60 seconds, and receives settings and firmware updates. EU device data must stay in the EU. Links between regions sometimes fail, and data centres have split in two while devices could still reach both halves. That's exactly how split brain happens.
 
-### Capacity math
+### Rough numbers
 
 | Stream | Rate | Size | Bandwidth |
 |---|---|---|---|
-| Heartbeats | 8M / 10 s = **800k msg/s** | ~200 B | ~160 MB/s |
-| Telemetry | 8M / 60 s = **133k msg/s** | ~1 KB | ~133 MB/s |
-| Total | ~930k msg/s | | ~300 MB/s ≈ **26 TB/day** before compression |
+| Heartbeats | 8M / 10 s = **800,000 messages/s** | ~200 bytes | ~160 MB/s |
+| Readings | 8M / 60 s = **133,000 messages/s** | ~1 KB | ~133 MB/s |
+| Total | ~930,000 messages/s | | ~300 MB/s ≈ **26 TB/day** before compression |
 
-### The key decision: pick the CAP position per data type, not per system
+### The key decision: choose consistency vs. availability *per type of data*
 
-| Data | Semantics | Choice | Mechanism |
+The **CAP theorem** says that when the network splits, a system must choose between staying **available** (AP: keep accepting work) and staying **consistent** (CP: refuse work rather than risk conflicts). You don't have to make one choice for the whole system. Choose for each kind of data:
+
+| Data | What it's like | Choice | How |
 |---|---|---|---|
-| **Telemetry readings** | Append-only facts, commutative | **AP** | Accept anywhere. Dedupe on `(device_id, boot_id, seq)`. Event-time watermarks handle late data |
-| **Presence (online/offline)** | Soft state, self-healing | **AP** | In-memory last-seen at the connection broker. Emit *transitions* only |
-| **Device shadow / desired config** | Must not diverge | **CP per device** | Single home region per device. Writes carry an **ownership epoch** |
-| **Firmware rollout plan** | Global, rare, high-impact | **CP, global** | Consensus-backed control plane plus human approval |
-| **Usage metering for billing** | Must reconcile | Eventual + reconciled | Idempotent counters, daily reconciliation |
+| **Sensor readings** | Facts that are only ever added. Order doesn't matter when merging | **AP** | Accept them anywhere. Remove duplicates by `(device_id, boot_id, seq)`. Handle late data with watermarks |
+| **Online/offline status** | Temporary, and fixes itself | **AP** | Keep "last seen" in the broker's memory. Only send changes |
+| **Device settings (shadow)** | Must never conflict | **CP per device** | Each device has one home region that makes changes, with an ownership **epoch** |
+| **Firmware rollout plan** | Global, rare, high-impact | **CP, global** | A consensus-backed control system, plus human approval |
+| **Usage counts for billing** | Must add up in the end | Eventual, then checked | Counters that are safe to repeat, and a daily check |
 
-### Architecture decisions
+### Design decisions
 
-- **Cells.** Each region runs several independent cells (MQTT broker cluster, stream processor, TSDB shard set). A cell has a bounded device count, so its blast radius is bounded too. Devices are assigned to a *home cell*.
-- **Heartbeats never hit a database.** The broker tracks `last_seen` in memory and publishes only `online→offline` and `offline→online` transitions. That turns 800k writes/s into perhaps thousands, which is the single biggest cost reduction in the design.
-- **Telemetry path:** MQTT broker (Azure Event Grid MQTT broker, IoT Hub, EMQX or HiveMQ) → Event Hubs/Kafka partitioned by `device_id` → stream processor (dedupe, enrichment, downsampling) → time-series store (Azure Data Explorer, Timescale, or InfluxDB). Raw data lands in ADLS/Parquet.
-- **Split-brain handling for the device shadow:**
-  - Each device's shadow has exactly one writer, its home region, which holds an ownership lease with an epoch recorded in a regional etcd/Raft store.
-  - Moving ownership to another region (a failover) requires a quorum decision in a **global control plane spanning at least three sites**: two regions plus a witness. The side of a partition that lacks quorum **cannot** take ownership.
-  - Every shadow write and every command sent to a device carries the epoch. When the partition heals, writes stamped with a lower epoch are rejected, and devices ignore commands with a stale epoch.
-  - The isolated minority side stays **fully available for telemetry** (AP), keeps shadows read-only (CP), and buffers commands. Availability is partial but coherent.
-- **Reconnect storms.** When a region recovers, millions of devices reconnect at once, and TLS handshakes saturate CPU.
-  - **Firmware must implement exponential backoff with full jitter.** This cannot be fixed server-side after shipping, so it is a Day 0 requirement.
-  - The broker applies token-bucket admission on `CONNECT` and returns MQTT 5 reason code *Server busy* when over budget.
-  - Use TLS session resumption to cut handshake cost.
-- **Protecting downstreams:** a per-device token bucket at the broker contains firmware bugs that spam messages. Per-tenant quotas protect shared cells. Circuit breakers sit in front of TSDB writes, spilling to durable Event Hubs retention when the breaker opens, with replay once it closes.
-- **Degradation ladder for this system:**
-  - L1: broadcast a command that raises the heartbeat interval to 60 s and drops debug-level telemetry.
-  - L2: accept only alarm-class messages.
-  - L3: devices store and forward from their local buffer. Firmware must support this.
+- **Cells.** Each region runs several independent "cells" (an MQTT broker cluster, a stream processor, a time-series database). Each cell has a maximum number of devices, so a problem in one cell affects only that many. Each device belongs to a *home cell*.
+- **Heartbeats never reach a database.** The broker tracks `last_seen` in memory and only publishes *changes* (went offline, came back online). That turns 800,000 writes per second into maybe a few thousand, which is the biggest cost saving in the design.
+- **Readings path:** MQTT broker (Azure Event Grid MQTT, IoT Hub, EMQX or HiveMQ) → Event Hubs/Kafka, split by `device_id` → stream processor (remove duplicates, add details, reduce detail) → time-series database (Azure Data Explorer, Timescale, InfluxDB). Raw data is also saved to ADLS as Parquet files.
+- **Avoiding split brain for device settings:**
+  - Each device's settings have exactly one owner, its home region, which holds a lease with an epoch number (stored in the region's etcd/Raft store).
+  - Moving ownership to another region requires a majority vote in a **global control system spread across at least 3 sites** (two regions plus a tiebreaker). The side of a split without a majority **can't** take ownership.
+  - Every settings change and every command sent to a device carries the epoch. After the split heals, changes with an older epoch are rejected, and devices ignore commands with an old epoch.
+  - The cut-off side **keeps accepting sensor readings** (AP), keeps settings read-only (CP), and holds commands until the link returns. It's partly available, but never inconsistent.
+- **Reconnect storms.** When a region recovers, millions of devices reconnect at once, and the encryption handshakes overload the servers.
+  - **Device firmware must retry with growing, random waits.** This can't be fixed on the server after devices ship, so it must be designed in from day one.
+  - The broker limits new connections with a token bucket and replies "server busy" (MQTT 5 has a code for this) when over the limit.
+  - TLS session resumption makes reconnecting cheaper.
+- **Protecting other systems:**
+  - A per-device rate limit at the broker stops buggy firmware from flooding the system.
+  - Per-customer limits protect shared cells.
+  - Circuit breakers sit in front of database writes. When they open, data waits safely in Event Hubs and is replayed once the database recovers.
+- **Degradation steps for this system:**
+  - L1: tell devices to send heartbeats every 60 s instead of 10 s, and stop debug data.
+  - L2: accept only alarms.
+  - L3: devices store data locally and send it later. The firmware must support this.
 
-## 3.4 Mermaid: Circuit Breaker State Transitions
+## 3.4 Diagram: Circuit Breaker State Transitions
 
 ```mermaid
 flowchart TD
@@ -469,37 +490,37 @@ flowchart TD
 
 *[Open full-size diagram: Circuit breaker state transitions (SVG)](../diagrams/m3-circuit-breaker-state-transitions.svg)*
 
-## 3.5 Animation Blueprint: Raft Leader Election When the Leader Goes Offline
+## 3.5 Animation Plan: Raft Leader Election When the Leader Goes Offline
 
-**Scene setup:**
+**Scene:**
 
-- Five nodes **S1–S5** on a pentagon, each drawn as a circle with a **term badge** (top right), a **role label** below, and an **election-timer ring** around it (an `Arc` driven by a `ValueTracker`).
-- Under each node sits a row of small log squares, coloured by term (term 1 grey, term 2 blue, term 3 green) and numbered by index.
-- **S1** is the gold leader in term 2. S5's log is shorter (index 5) than the others (index 7).
-- A seeded RNG sets the timeouts: S2 = 210 ms, S3 = 170 ms, S4 = 260 ms, S5 = 190 ms, rendered at slow-motion scale.
+- Five machines **S1–S5** arranged in a pentagon. Each is a circle with a **term badge** (top right), a **role label** underneath, and an **election timer ring** around it.
+- Under each machine is a row of small log squares, coloured by term (term 1 grey, term 2 blue, term 3 green) and numbered.
+- **S1** is the gold leader in term 2. S5's log is shorter (5 entries) than the others' (7).
+- Timeouts are fixed for repeatability: S2 = 210 ms, S3 = 170 ms, S4 = 260 ms, S5 = 190 ms, shown in slow motion.
 
-| Time | Beat | Visual | Manim primitives |
+| Time | Step | What you see | Manim tools |
 |---|---|---|---|
-| 0:00–0:06 | **Steady state** | S1 sends heartbeat dots along its edges every beat. Each follower's timer ring snaps back to full on receipt. Caption: *Heartbeats are empty AppendEntries* | `MoveAlongPath(Dot)`, `ttl.animate.set_value(1)` |
-| 0:06–0:08 | **Leader crash** | S1 fades to grey, a red ✕ appears, and heartbeats stop | `FadeToColor`, `Create(Cross)` |
-| 0:08–0:12 | **Timers drain** | All four rings drain at their own speeds. A small ms label per node shows the randomized timeout | Per-node `ValueTracker`, `rate_func=linear` with different `run_time` |
-| 0:12–0:14 | **S3 times out first** | S3 turns amber and becomes *Candidate*. Its term badge flips 2 → 3. A vote counter `1/5` appears (it votes for itself) | `Transform(badge)`, `Indicate` |
-| 0:14–0:18 | **RequestVote** | Envelopes labelled `term=3, lastLogIndex=7, lastLogTerm=2` travel to S2, S4 and S5. Each receiver's term flips to 3 and its ring resets | `LaggedStart(MoveAlongPath)` |
-| 0:18–0:21 | **Votes** | S2 and S4 return green ✓ envelopes, and the counter becomes `3/5`. A **majority** banner flashes | `Flash`, `ChangeDecimalToValue` |
-| 0:21–0:24 | **New leader** | S3 turns gold, gains the crown and sends heartbeats immediately. Every ring resets | `Transform`, `LaggedStart` |
-| 0:24–0:30 | **Commit a no-op** | S3 appends a green term-3 entry at index 8 and replicates it. As acks arrive, a *commitIndex* marker slides to 8 once 3 of 5 hold the entry | `FadeIn(square)`, `MoveToTarget(marker)` |
-| 0:30–0:36 | **Inset: why S5 couldn't win** | A picture-in-picture replay shows S5 timing out first with `lastLogIndex=5`. S2, S3 and S4 reply ✕, because a stale log means no vote. Caption: *The election restriction keeps committed entries safe* | `Rectangle` inset, scaled `VGroup` copy |
-| 0:36–0:42 | **Old leader returns** | S1 revives, still thinks it is a term-2 leader, and sends `AppendEntries term=2` with an uncommitted entry at index 8. The followers reply `term=3`. S1 flips to *Follower*, its term badge jumps to 3, and its conflicting index-8 entry is struck through in red and replaced by S3's green entry | `Transform`, `Strikethrough`-style `Line`, `ReplacementTransform` |
-| 0:42–0:50 | **Bonus: split vote** | New scenario in term 4: S2 and S4 time out together, and each gets 2 votes. Both counters stall at `2/5`, the timers re-randomize, and S4 wins in term 5. Caption: *Randomized timeouts make split votes rare and short* | Parallel `AnimationGroup`s |
-| 0:50–1:00 | **Bonus: network partition** | A red dashed line cuts {S1, S2} from {S3, S4, S5}. A client write sent to S1 shows a spinning *pending* ring that never completes (2/5). The majority side commits normally. Caption: *No majority, no commit. Raft prevents split-brain commits, not split-brain beliefs* | `DashedLine`, `Rotate(ring)` loop |
+| 0:00–0:06 | **Normal** | S1 sends heartbeat dots along its lines. Each follower's timer ring refills when a dot arrives. Caption: *Heartbeats are empty AppendEntries messages* | `MoveAlongPath(Dot)`, ring refill |
+| 0:06–0:08 | **Leader crashes** | S1 turns grey with a red ✕. Heartbeats stop | `FadeToColor`, `Create(Cross)` |
+| 0:08–0:12 | **Timers run down** | The four rings drain at different speeds, each labelled with its random timeout | One `ValueTracker` per machine, different run times |
+| 0:12–0:14 | **S3 times out first** | S3 turns amber (*Candidate*). Its term badge flips from 2 to 3. A vote counter shows `1/5` (its own vote) | `Transform`, `Indicate` |
+| 0:14–0:18 | **Asking for votes** | Envelopes labelled `term=3, lastLogIndex=7, lastLogTerm=2` travel to S2, S4 and S5. Each receiver's term flips to 3 and its timer resets | `LaggedStart(MoveAlongPath)` |
+| 0:18–0:21 | **Votes** | S2 and S4 send back green ✓ envelopes. The counter reaches `3/5` and a **majority** banner flashes | `Flash`, counter change |
+| 0:21–0:24 | **New leader** | S3 turns gold, gets a crown, and sends heartbeats straight away. All rings reset | `Transform`, `LaggedStart` |
+| 0:24–0:30 | **First commit** | S3 adds an empty green term-3 entry at position 8 and sends it out. When 3 of 5 have it, a *committed* marker slides to position 8 | `FadeIn(square)`, moving marker |
+| 0:30–0:36 | **Side panel: why S5 couldn't win** | A small replay shows S5 timing out first with only 5 entries. S2, S3 and S4 all reply ✕, because a shorter log means no vote. Caption: *This rule keeps committed entries safe* | Inset panel, scaled copy |
+| 0:36–0:42 | **Old leader returns** | S1 recovers, still thinks it's the term-2 leader, and sends `AppendEntries term=2` with an uncommitted entry at position 8. The followers reply `term=3`. S1 becomes a *Follower*, its term jumps to 3, and its conflicting entry is crossed out in red and replaced with S3's green one | `Transform`, strikethrough `Line`, `ReplacementTransform` |
+| 0:42–0:50 | **Bonus: tied vote** | New round, term 4: S2 and S4 time out together and each gets 2 votes. Both counters stall at `2/5`, the timers reset randomly, and S4 wins in term 5. Caption: *Random timeouts make ties rare and short* | Two parallel animation groups |
+| 0:50–1:00 | **Bonus: network split** | A red dashed line separates {S1, S2} from {S3, S4, S5}. A write sent to S1 shows a spinning *pending* ring that never finishes (only 2 of 5). The majority side commits normally. Caption: *No majority, no commit. Raft prevents split-brain commits, not split-brain beliefs* | `DashedLine`, spinning ring |
 
-## 3.6 Staff-level Review Questions
+## 3.6 Review Questions
 
-- For each data type, have we chosen CP or AP explicitly, and does the product team agree with that choice?
-- What stops a region on the losing side of a partition from issuing commands? Point to the specific epoch check.
-- What is the worst-case retry amplification across all layers during a full dependency outage?
-- Which breaker trips first when one database shard of 32 fails, and does it take the other 31 with it?
-- How long does a full reconnect of the largest region take under admission control, and has it been load-tested?
+- For each type of data, have we chosen availability or consistency on purpose, and does the product team agree?
+- What stops a region on the losing side of a split from sending commands? Point to the exact epoch check.
+- During a full outage of a service, what's the worst-case number of retries across all layers?
+- When 1 of 32 database shards fails, which breaker trips first, and does it take the other 31 down with it?
+- How long does the biggest region take to fully reconnect under admission limits, and have you tested it?
 
 ---
 

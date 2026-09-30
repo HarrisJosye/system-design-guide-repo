@@ -1,17 +1,17 @@
 # Module 0 — Core Building Blocks: The Six Scaling Concerns
 
-*Cross-industry foundations used by every later module*
+*Foundations used in every other module*
 
-Most system design problems reduce to six recurring concerns. This module treats each one on its own, with techniques, trade-offs, Python and a block diagram. Modules 1–6 then apply them under industry-specific pressure.
+Most system design problems come down to six questions. This module answers each one with the main techniques, what they cost, some Python, and a diagram. The later modules reuse these ideas in real industries.
 
-| Concern | The core question | Primary techniques | Deeper in |
+| Concern | The question it answers | Main techniques | See also |
 |---|---|---|---|
-| **Scale reads** | How do we serve 10–1,000× more reads than writes without melting the database? | Indexes, caching layers, replicas, denormalized read models | M1 (CQRS), M2 (caching), M4 (replicas) |
-| **Scale writes** | How do we absorb more writes than one node can durably commit? | Batching, queues for load leveling, partitioning, write-optimized storage | M1 (ledger shards), M3 (IoT ingest), M4 (sharding, WAL) |
-| **Split reads and writes** | How do reads and writes scale independently without users seeing stale or wrong data? | Replica routing, CQRS, consistency tokens, staleness budgets | M1 (CQRS), M4 (routing) |
-| **Real-time data** | How do changes reach users and systems within milliseconds to seconds? | CDC and events, push channels, pub/sub fan-out, snapshot + delta | M2 (SSE), M5 (stream processing) |
-| **Reliability** | How does the system keep its promises when parts of it fail? | SLOs, redundancy, timeouts, retries, breakers, DR, safe deploys | M3 (resiliency), M4 (replication) |
-| **Long-running jobs** | How does work that takes minutes to hours survive crashes, deploys and retries? | Async request–reply, leases and heartbeats, checkpoints, durable workflows | M6 (batch parallel run) |
+| **Scale reads** | How do we serve far more reads than writes without overloading the database? | Better queries, caches, replicas, precomputed read tables | M1, M2, M4 |
+| **Scale writes** | How do we save more writes than one database machine can handle? | Batching, queues, splitting data across machines | M1, M3, M4 |
+| **Split reads and writes** | How do reads and writes grow separately without users seeing wrong data? | Replicas, separate read models, "freshness" rules per page | M1, M4 |
+| **Real-time data** | How do changes reach users within seconds or less? | Change events, WebSockets/SSE, pub/sub | M2, M5 |
+| **Reliability** | How does the system keep working when parts break? | Targets (SLOs), spare copies, timeouts, retries, backups | M3, M4 |
+| **Long-running jobs** | How does work that takes minutes or hours survive crashes and restarts? | Job queues, leases, heartbeats, checkpoints | M6 |
 
 ```mermaid
 flowchart LR
@@ -53,52 +53,53 @@ flowchart LR
 
 *[Open full-size diagram: The read-scaling ladder, cheapest rung first (SVG)](../diagrams/m0-the-read-scaling-ladder-cheapest-rung-first.svg)*
 
-### Theory & trade-offs
+### The idea
 
-Reads usually dominate, at 10:1 to 1,000:1 over writes. They are also *easier* to scale than writes, because a read can be served from a copy. **The whole discipline is deciding how stale each copy may be.** Climb the ladder from the bottom and stop as soon as the numbers work, because every rung adds staleness and operational cost.
+Most systems get far more reads than writes: often 10 to 1,000 times more. Reads are the easier side to scale, because a read can be answered from a **copy** of the data. The real question is always: **how old is that copy allowed to be?**
 
-1. **Fix the queries first.** A covering index, removing an N+1 pattern, or paginating by keyset instead of `OFFSET` routinely buys 10–100× before any architecture changes.
-2. **Cache in layers:**
-   - the browser or client (HTTP `Cache-Control`, `ETag`);
-   - a **CDN** for static assets and cacheable API responses;
-   - a **distributed cache** (Redis);
-   - an **in-process cache** (an LRU with a sub-second to seconds TTL, for the hottest keys);
-   - the database's own buffer pool.
-3. **Read replicas** add read capacity linearly, with replication lag as the price.
-4. **Denormalized read models** (CQRS projections, materialized views) precompute the answer so that a read becomes a single key lookup.
-5. **Specialized stores** each answer a query shape the OLTP database is bad at: search engines for text, columnar warehouses for analytics, vector indexes for similarity.
-6. **Partitioning** is the last rung, used when the dataset itself no longer fits one node's memory and I/O.
+Work up the ladder from the cheapest step, and stop as soon as it's fast enough. Each step up adds cost and makes data a little more out of date.
 
-**Hit-ratio arithmetic is non-linear.** Database load is `total × (1 − hit ratio)`. Going from a 90% to a 99% hit ratio cuts database load **10×**, while going from 50% to 90% cuts it only 5×. The last few percent of hit ratio are where the money is, and they usually come from better key design, longer TTLs on immutable data, and caching negative results.
+1. **Fix the queries.** Add the right index, remove N+1 queries (one query per row in a loop), and page with "WHERE id > last_id" instead of `OFFSET`. This alone often makes things 10 to 100 times faster.
+2. **Add caches, in layers:**
+   - the browser (HTTP caching headers);
+   - a **CDN** (servers close to users that store copies of pages and files);
+   - a shared cache such as **Redis**;
+   - a small in-memory cache inside each app process for the very hottest data.
+3. **Add read replicas.** These are copies of the database that only serve reads. Each one adds read capacity, but it lags a little behind the primary.
+4. **Build read models.** Tables or views where the answer is already computed, so a page loads with a single lookup instead of a join across many tables.
+5. **Use a specialized store** for query types the main database is bad at: a search engine for text, a data warehouse for reports, a vector index for "find similar meaning".
+6. **Split the data across machines (sharding)**, but only when the data itself no longer fits on one machine.
+
+**Cache hit ratio matters more than it looks.** The database only sees the cache misses: `database load = total reads × (1 − hit ratio)`. At a 90% hit ratio the database gets 10% of reads. At 99% it gets 1%, which is **10 times less load**. Small gains near the top make a big difference.
 
 ### Caching patterns
 
-| Pattern | How it works | Strength | Weakness |
+| Pattern | How it works | Good | Bad |
 |---|---|---|---|
-| **Cache-aside** | The app reads the cache. On a miss it reads the DB, then populates the cache | Simple. The cache holds only what's used | Race conditions on invalidation. The first read after expiry is slow |
-| **Read-through** | The cache library loads from the DB on a miss | Loading logic lives in one place | Needs cache-side integration |
-| **Write-through** | Writes go to the cache and the DB synchronously | The cache is always warm and fresh | Every write pays cache latency. Caches data nobody reads |
-| **Write-behind** | Writes go to the cache, and the DB is updated asynchronously | Very fast writes | Data loss if the cache dies before the flush. **Almost never acceptable for money** |
-| **Refresh-ahead** | Hot keys are refreshed before they expire | No latency spike on expiry | Wasted refreshes on keys that went cold |
+| **Cache-aside** (most common) | The app checks the cache. On a miss it reads the database and saves the result in the cache | Simple. Only caches data that's actually used | The first read after expiry is slow. Easy to get cache clearing wrong |
+| **Read-through** | The cache itself loads from the database on a miss | Loading logic is in one place | Needs a cache library that supports it |
+| **Write-through** | Every write updates the cache and the database together | The cache is always fresh | Every write is slower. Caches data nobody reads |
+| **Write-behind** | Writes go to the cache first, and the database is updated later | Very fast writes | Data is lost if the cache crashes first. **Never use for money** |
+| **Refresh-ahead** | Refresh popular items before they expire | No slow first read | Wasted work refreshing items nobody wants anymore |
 
-**Invalidation.** Use TTL for everything, plus explicit invalidation for data that must not be stale:
+**Keeping the cache correct (invalidation):**
 
-- On write, **delete** the key. Don't set it: two concurrent writers can otherwise leave the older value in the cache.
-- Classic cache-aside still has a race: a reader loads the old row, a writer updates the DB and deletes the key, and *then* the reader writes the stale value it loaded. Mitigations include short TTLs, versioned values (write only if the version is newer), a second delayed delete, or **leases** (the cache hands a token to the first misser and rejects sets carrying stale tokens, as Facebook's memcache paper describes).
-- **CDC-driven invalidation** consumes the database's change stream and deletes affected keys, so invalidation cannot be forgotten by a code path.
+- Give every cached item a **TTL** (time to live), so it expires automatically.
+- When data changes, **delete** the cache entry. Don't overwrite it, because two writers could leave the older value behind.
+- There is still a small race condition: a reader loads the old row, a writer changes the database and deletes the cache entry, and then the reader saves its old copy into the cache. Fixes include short TTLs, storing a version number with the value, deleting the entry a second time a moment later, or "leases", where only the first request after a miss is allowed to fill the cache.
+- A robust option is to clear cache entries from the **database's change stream (CDC)**. That way no code path can forget to do it.
 
-**Failure modes you must design for:**
+**Common cache problems to design for:**
 
-- **Cache stampede.** A hot key expires, and 5,000 concurrent requests all miss and hit the database at once. Fixes:
-  - **single-flight** (request coalescing): one loader per key, and everyone else awaits it;
-  - **stale-while-revalidate**: serve the stale value while one request refreshes;
-  - **jittered TTLs**, so keys cached together don't expire together;
-  - probabilistic early refresh.
-- **Hot keys.** One key receives a large share of traffic (a celebrity profile, today's rates table) and saturates one cache shard. Fixes: an in-process tier in front, replicating the key across shards (`key#0..key#7`, choosing one at random), or pushing it to the CDN.
-- **Cold start.** A cache flush or new cluster sends 100% of reads to the database. Capacity-plan the database for a *degraded hit ratio*, warm caches before shifting traffic, and shed load if needed.
-- **The cache becomes a hard dependency.** Decide explicitly what happens when Redis is down: serve from the database with shedding, or fail fast.
+- **Cache stampede.** A popular item expires and thousands of requests all miss at once and hit the database together. Fixes:
+  - **request coalescing ("single-flight")**: only one request loads the value while the rest wait for it;
+  - **serve stale while refreshing**: return the old value while one request fetches the new one;
+  - **add randomness to TTLs** so items don't all expire at the same moment.
+- **Hot keys.** One item gets so much traffic that it overloads one cache server. Fixes: keep a copy in each app's local memory, spread copies across several cache keys, or put it on the CDN.
+- **Cold cache.** After a restart, the cache is empty and every read hits the database. Make sure the database can survive a low hit ratio, warm the cache up first, and turn away extra load if needed.
+- **The cache goes down.** Decide ahead of time what happens: read from the database with limits, or fail fast.
 
-### Python: cache-aside with single-flight, stale-while-revalidate and jitter
+### Python: a cache with request coalescing, stale-while-refresh and random TTLs
 
 ```python
 import asyncio
@@ -151,7 +152,7 @@ async def _load(key: str, loader: Callable[[], Awaitable[dict]],
         _inflight.pop(key, None)
 ```
 
-Single-flight here is **per process**. With 200 pods, a stampede becomes at most 200 loads instead of 5,000, which is usually enough. For truly expensive loaders, add a short Redis `SET NX` lease so only one process fleet-wide recomputes, while the others keep serving stale values.
+"Single-flight" here works **per app process**. With 200 app servers, a stampede becomes at most 200 database loads instead of thousands, which is usually fine. For very expensive loads, add a short Redis lock so only one server in the whole fleet refreshes the value while the rest keep serving the old one.
 
 ## 0.2 Scale Writes
 
@@ -173,31 +174,33 @@ flowchart LR
 
 *[Open full-size diagram: Write-scaling path, from request to durable storage (SVG)](../diagrams/m0-write-scaling-path-from-request-to-durable-storage.svg)*
 
-### Theory & trade-offs
+### The idea
 
-Writes are harder than reads for three reasons. They must be **durable** (an fsync, a replica ack), they must be **ordered** for the same entity, and they **cannot be served from a copy**. Every technique below either makes a single write cheaper, groups writes together, or spreads them across more independent writers.
+Writes are harder to scale than reads, for three reasons:
 
-| Technique | What it buys | What it costs |
+- they must be **saved safely** (written to disk and usually copied to a replica);
+- writes to the same thing (like one bank account) often must happen **in order**;
+- they **can't be answered from a copy**.
+
+Every technique below does one of three things: it makes each write cheaper, groups many writes together, or spreads writes across more machines.
+
+| Technique | What you gain | What you give up |
 |---|---|---|
-| **Cheaper writes** (fewer indexes, append instead of update-in-place, bulk `COPY`) | 2–10× on the same hardware | Slower reads for dropped indexes |
-| **Batching and group commit** | Amortizes fsyncs and network round trips across many writes | Adds up to the batch window in latency |
-| **Queue-based load leveling** (accept, enqueue, return `202`) | Absorbs spikes. The database runs at a steady rate | Asynchronous results. You need idempotency and a status API |
-| **Partitioning** by entity key | The only way to scale one logical write stream horizontally | Cross-partition operations become sagas. Hot keys still hurt |
-| **Write-optimized storage** (LSM trees such as Cassandra, ScyllaDB and RocksDB, or time-series DBs) | Sequential disk writes, very high ingest | Read amplification and compaction tuning |
-| **Contention removal** (commutative appends, sharded counters) | Removes the row-lock bottleneck on hot entities | Reads must merge the pieces |
-| **Mergeable data types** (CRDTs) | Multi-region writes without coordination | Only for data with natural merge semantics |
+| **Cheaper writes** (fewer indexes, append new rows instead of updating, bulk `COPY`) | 2–10× faster on the same hardware | Some reads get slower without those indexes |
+| **Batching** (save many writes in one go) | Far fewer disk syncs and round trips | Each write waits a few milliseconds for its batch |
+| **Queue in front** (accept the request, reply "202 Accepted", process it later) | Traffic spikes are absorbed and the database works at a steady pace | The result isn't immediate. You need a way to report status, and safe retries |
+| **Split data by key (sharding)** | Many machines accept writes at once | Operations across two shards get harder |
+| **Write-optimized databases** (Cassandra, ScyllaDB, time-series databases) | Very high write rates | Reads and maintenance are harder |
+| **Avoid fighting over one row** (append instead of update, split one counter into several) | No lock queue on busy rows | Reads must add the pieces together |
+| **Mergeable data types (CRDTs)** | Writes in several regions without coordination | Only works for data that merges naturally, such as counters and sets |
 
-**Ordering is the hidden scalability limit.** A single global order doesn't scale, because one sequencer eventually saturates. *Per-key* order does scale. Decide which entities need ordering (an account's postings, a device's configuration) and partition by exactly that key. Everything else can be unordered.
+**Ordering limits scaling.** If *everything* must be in one global order, one machine ends up doing the ordering, and it becomes the bottleneck. Usually only writes to the *same thing* need ordering, such as one account's transactions or one device's settings. So split the data by that key, and let everything else run in parallel.
 
-**Hot partitions.** A skewed key (a marketplace merchant, a viral post, a single noisy tenant) concentrates writes on one partition however many you have. Options:
+**Hot partitions.** If one key is extremely busy (a huge merchant, a viral post, one big customer), it overloads its shard however many shards you have. Fixes: split the key into sub-keys (`merchant-42#0` to `#15`) and add them up when reading, append changes and combine them in batches, or give that key its own machine.
 
-- **Key salting:** write to `merchant-42#0..#15` and merge on read.
-- **Commutative appends** that are folded in batches.
-- **Dedicated capacity** for known-huge keys.
+**A queue is a buffer, not extra capacity.** If messages arrive faster than you process them for long enough, the queue grows forever. Set a target such as "messages wait less than 30 seconds", add workers based on how long messages have been waiting (not on CPU), and turn requests away when the queue is too far behind.
 
-**Queues are buffers, not capacity.** Little's Law applies: if arrivals exceed the service rate for long enough, the backlog grows without bound. Set a **maximum queue-age SLO** (for example, "p99 message age under 30 s"), autoscale consumers on queue age rather than CPU, and shed or reject at the edge when the backlog breaches the limit.
-
-### Python: an async micro-batcher with per-item completion
+### Python: an async micro-batcher
 
 ```python
 import asyncio
@@ -250,7 +253,7 @@ async def flush_events(rows: list[tuple]) -> None:
             "ON CONFLICT (event_id) DO NOTHING", rows)
 ```
 
-The trade-off is explicit and tunable: `max_wait_s=0.010` adds up to 10 ms of latency per write and can raise throughput by an order of magnitude, because one round trip and one commit now cover up to 500 rows.
+The trade-off is easy to tune. Waiting up to 10 ms adds a little delay to each write, but one database round trip and one commit now save up to 500 rows. That can mean 10 times more writes per second.
 
 ## 0.3 Split Reads and Writes
 
@@ -275,41 +278,41 @@ flowchart LR
 
 *[Open full-size diagram: Separating the read path from the write path (SVG)](../diagrams/m0-separating-the-read-path-from-the-write-path.svg)*
 
-### Theory & trade-offs
+### The idea
 
-Splitting reads from writes lets each side scale, be optimized, and even use different technology independently. It exists on a spectrum, and each level buys more read scale in exchange for more staleness and more moving parts:
+If reads and writes use separate paths, each side can grow and be optimized on its own, even with different databases. There are several levels. Each level gives you more read capacity, but data gets more out of date and there are more parts to run.
 
-| Level | Separation | Read staleness | Complexity |
+| Level | What's separated | How stale reads can be | Complexity |
 |---|---|---|---|
-| **L1** | Same database, separate command and query code paths | None | Low |
-| **L2** | Primary for writes, **replicas** for reads | Replication lag (ms to s, occasionally minutes) | Medium |
-| **L3** | **CQRS**: read models built from events or CDC | Projection lag | High |
-| **L4** | Several read stores per query shape (search, cache, warehouse) | Varies per store | Highest |
+| **L1** | Same database, but separate code for reads and writes | Not stale | Low |
+| **L2** | Writes go to the primary, reads go to **replicas** | A little: milliseconds to seconds, sometimes minutes | Medium |
+| **L3** | **CQRS**: separate read tables, built from change events | The time it takes to update the read tables | High |
+| **L4** | Several read stores for different needs (search, cache, warehouse) | Different for each store | Highest |
 
-**The anomalies you create, and their fixes:**
+**Problems this causes, and how to fix them:**
 
-| Anomaly | Example | Fix |
+| Problem | Example | Fix |
 |---|---|---|
-| **Read-your-writes** | The user saves a profile, refreshes, and sees the old one | Return a **consistency token** (commit LSN or version) from the write, and read from a replica only once it has replayed past the token. Otherwise read from the primary |
-| **Monotonic reads** | Two refreshes hit different replicas, and the data appears to go back in time | Pin the session to one replica, or carry the highest token seen |
-| **Causal consistency** | A reply is visible before the message it answers | Carry tokens across services, or read both from the same source |
+| **Not seeing your own write** | You save your profile, refresh, and see the old version | After the write, give the client a **token** (the database's log position or a version). Only read from a replica that has caught up to that token, otherwise read from the primary |
+| **Going back in time** | Two refreshes hit different replicas, and newer data seems to disappear | Keep a user on one replica, or remember the newest token they've seen |
+| **Effects before causes** | A reply shows up before the message it answers | Carry tokens between services, or read both items from the same place |
 
-**Decide a staleness budget per endpoint**, and write it down. It turns a vague architecture debate into a routing table:
+**Write down a "freshness budget" for every page or API.** It turns a vague debate into a simple routing table:
 
-| Read | Staleness budget | Route |
+| Read | How stale it may be | Where to read |
 |---|---|---|
-| Balance used to authorize a payment | 0 | Primary only |
-| Balance shown right after the user's own transfer | Read-your-writes | Replica if caught up to the token, else primary |
-| Transaction history page | ≤ 5 s | Replica |
-| Monthly spending insights | ≤ 1 h | Warehouse / read model |
+| Balance used to approve a payment | Must be current | Primary only |
+| Balance shown right after your own transfer | Must include your own write | Replica if caught up, else primary |
+| Transaction history page | Up to 5 seconds old | Replica |
+| Monthly spending chart | Up to 1 hour old | Warehouse or read model |
 
-**Where to route:**
+**Where the routing decision can happen:**
 
-- **In the application** (SQLAlchemy `get_bind`, Django routers; see Module 4). This is the most control, and the only place that knows staleness budgets.
-- **In the driver.** PostgreSQL's libpq accepts multi-host connection strings with `target_session_attrs` values such as `read-write`, `standby` and `prefer-standby` (PostgreSQL 14+). This is good for failover, but blind to per-request budgets.
-- **In a proxy** (Pgpool-II for PostgreSQL, ProxySQL for MySQL). Transparent, but the proxy can't know which reads tolerate lag.
+- **In the app code** (SQLAlchemy `get_bind`, Django database routers; see Module 4). You have the most control, and it's the only place that knows each page's freshness budget.
+- **In the database driver.** PostgreSQL's libpq can take several hosts and a `target_session_attrs` setting such as `read-write` or `prefer-standby` (PostgreSQL 14+). Great for failover, but it can't tell which reads are allowed to be stale.
+- **In a proxy** (Pgpool-II for PostgreSQL, ProxySQL for MySQL). Invisible to the app, but it can't know which reads may be stale either.
 
-### Python: read-your-writes routing with LSN consistency tokens
+### Python: read-your-own-writes using database log positions
 
 ```python
 import asyncio
@@ -363,7 +366,7 @@ async def read_with_token(primary: asyncpg.Pool, replicas: dict[str, asyncpg.Poo
     return await pool.fetch(sql, *args)
 ```
 
-The client stores the token (in a cookie or header) for a short window after its own write and echoes it on reads. Everyone else reads from replicas with no token.
+The client keeps the token (in a cookie or header) for a short time after its own write and sends it with reads. Everyone else reads from replicas without a token.
 
 ## 0.4 Real-Time Data
 
@@ -387,35 +390,35 @@ flowchart LR
 
 *[Open full-size diagram: Real-time delivery - capture, fan out, push, resync (SVG)](../diagrams/m0-real-time-delivery-capture-fan-out-push-resync.svg)*
 
-### Theory & trade-offs
+### The idea
 
 Real-time data has two halves:
 
-1. **Capturing changes** the moment they happen: an outbox table or CDC from the database (Module 1), and domain events.
-2. **Delivering them** to people and systems with low latency, over push channels.
+1. **Noticing changes** the moment they happen, using an outbox table or CDC (see Module 1) and events.
+2. **Delivering** those changes to users and other systems quickly, using "push" channels.
 
-Real-time *analytics* (computing over streams, as in Module 5's fraud features) is a third, separate concern.
+Analysing data as it flows (like fraud detection in Module 5) is a separate topic.
 
-**Delivery channel options:**
+**Ways to deliver updates:**
 
-| Channel | Direction | Latency | Strengths | Weaknesses |
+| Method | Direction | Delay | Good | Bad |
 |---|---|---|---|---|
-| Short polling | Client pulls | Poll interval | Trivial, cache-friendly | Wasted requests. Latency equals the interval |
-| Long polling | Client pulls, server holds | Low | Works everywhere | Connection churn |
-| **SSE** | Server → client | Low | Plain HTTP, built-in resume via `Last-Event-ID` | One direction. Browsers limit connections on HTTP/1.1 |
-| **WebSocket** | Bidirectional | Lowest | Interactive, binary | Stateful connections, harder behind proxies |
-| Webhooks | Server → server | Low | Standard for partner integrations | Receiver availability, retries, signature verification |
-| Mobile push (APNs/FCM) | Server → device | Seconds, best-effort | Reaches closed apps | No delivery guarantee. Payload limits |
+| Short polling (ask every few seconds) | Client asks | As long as the interval | Very simple | Many wasted requests |
+| Long polling (server holds the request open until there's news) | Client asks | Low | Works everywhere | Constant reconnecting |
+| **SSE (Server-Sent Events)** | Server → client | Low | Plain HTTP. Can resume where it left off | One direction only |
+| **WebSocket** | Both directions | Lowest | Interactive, supports binary data | Keeps a connection open per user. Harder through proxies |
+| Webhooks | Server → another server | Low | Standard way to notify partner systems | The receiver must be up. Needs retries and signature checks |
+| Mobile push (APNs, FCM) | Server → phone | Seconds, best effort | Reaches apps that are closed | Delivery isn't guaranteed. Small payloads only |
 
-**Principles that separate robust real-time systems from demos:**
+**Rules that make real-time systems robust:**
 
-- **The push channel is an optimization. The API is the truth.** Messages *will* be lost (a phone switching networks, a gateway restart). Every channel therefore needs **sequence numbers**. On reconnect, the client sends its last sequence number. The server either **replays** from a short buffer, or tells the client to **resync** by fetching a snapshot from the REST API and resubscribing. This is the **snapshot + delta** pattern.
-- **Fan-out is its own tier.** Connection-holding gateways are stateful, so keep them thin. A pub/sub backplane routes each event only to the gateways that hold the relevant connections. Managed options such as Azure Web PubSub or SignalR Service take this tier off your hands.
-- **Fan-out on write vs. on read.** For feeds, pushing each event into every follower's inbox (on write) is fast to read but expensive for accounts with millions of followers. Pulling at read time is the reverse. Hybrid designs push for normal users and pull for the huge ones.
-- **Slow consumers:** use bounded per-connection buffers. Disconnect clients that can't keep up rather than buffering forever. For market data and dashboards, **conflate**: send only the latest value per key and drop intermediate ticks.
-- **Critical notifications need a durable path.** WebSocket delivery is effectively at-most-once. For "your card was declined", also write to a durable inbox, and push a hint that says "go fetch".
+- **The push channel is a shortcut. The API is the truth.** Messages *will* get lost, for example when a phone switches networks or a server restarts. So number every message. When a client reconnects, it sends the last number it saw. The server either **replays** what was missed, or tells the client to **reload a fresh snapshot** from the normal API. This is called the **snapshot + updates** pattern.
+- **Keep the connection servers thin.** The servers that hold open connections should do little else. A pub/sub system (Redis, NATS, or managed services such as Azure Web PubSub) sends each event only to the servers that hold the right users' connections.
+- **Push on write vs. pull on read.** For feeds, copying each post into every follower's inbox makes reading fast, but it's expensive for accounts with millions of followers. Many systems push for normal accounts and pull for huge ones.
+- **Slow clients:** give each connection a small, limited buffer, and disconnect clients that can't keep up. For live prices or dashboards, send only the **latest** value and skip the in-between ones.
+- **Important alerts need a second path.** A WebSocket message may be lost. For "your card was declined", also save the message to an inbox in the database, and use the push only as a hint to go check it.
 
-### Python: WebSocket feed with replay, resync and heartbeats (Redis Streams)
+### Python: a WebSocket feed that replays, reloads and sends heartbeats (Redis Streams)
 
 ```python
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -458,7 +461,7 @@ async def account_feed(ws: WebSocket, account_id: str, last_id: str | None = Non
         return
 ```
 
-**The scaling caveat, stated plainly:** one blocking `XREAD` per connection means one Redis connection per user, which is fine for thousands of users and wrong for hundreds of thousands. At scale, each gateway process subscribes *once* per channel (or per shard of channels) through a backplane, keeps a local registry of connection → channels, and fans out in memory. The replay and resync protocol stays exactly the same.
+**Important limit:** this example keeps one blocking Redis read per connected user. That's fine for thousands of users but wrong for hundreds of thousands. At that scale, each server process subscribes *once* to each channel, keeps its own list of which connections want which channel, and forwards messages in memory. The replay and reload rules stay the same.
 
 ## 0.5 Reliability
 
@@ -490,60 +493,60 @@ flowchart TB
 
 *[Open full-size diagram: Reliability layers, from process to region (SVG)](../diagrams/m0-reliability-layers-from-process-to-region.svg)*
 
-### Theory & trade-offs
+### The idea
 
-Reliability means the system does what it promises, **measured from the user's point of view**. Precise vocabulary:
+Reliability means the system does what it promises, **as seen by users**. Some useful terms:
 
-- **SLI:** a measured indicator, such as the fraction of balance requests served successfully in under 300 ms.
-- **SLO:** the target for that indicator (99.95% over 28 days).
-- **SLA:** the contractual promise, set looser than the SLO.
-- **Error budget:** `1 − SLO`. A 99.95% SLO allows ~21.9 minutes of failure per month. When the budget is spent, releases slow down. When it's healthy, the team can move faster.
-- **RPO / RTO:** how much data you may lose, and how long recovery may take, per failure scenario.
+- **SLI:** something you measure, for example "the share of balance requests answered successfully within 300 ms".
+- **SLO:** the target for it, for example "99.95% over 28 days".
+- **SLA:** a promise in a contract. It is set a bit lower than the SLO, to leave a safety margin.
+- **Error budget:** the failures your SLO allows. A 99.95% target allows about 22 minutes of failure per month. If you use it up, slow down releases. If you have plenty left, you can move faster.
+- **RPO / RTO:** how much data you may lose, and how long recovery may take.
 
-| Availability | Downtime per 30 days |
+| Availability | Downtime allowed per 30 days |
 |---|---|
-| 99% | 7.2 h |
-| 99.9% | 43.2 min |
-| 99.95% | 21.6 min |
-| 99.99% | 4.3 min |
+| 99% | 7.2 hours |
+| 99.9% | 43 minutes |
+| 99.95% | 22 minutes |
+| 99.99% | 4.3 minutes |
 
-**Availability math:**
+**Reliability maths:**
 
-- **Serial dependencies multiply.** Five required dependencies at 99.9% each give at most 0.999⁵ ≈ **99.5%**.
-- **Redundancy multiplies failure probabilities**, *if failures are independent*. Two independent 99% replicas give 1 − 0.01² = 99.99%.
-- **Failures are rarely independent**: shared deploys, shared configuration, shared regions, shared bugs. Correlated failure is why redundancy alone disappoints.
+- **Things you depend on multiply together.** If your service needs five other services and each is up 99.9% of the time, your service is up at most 0.999⁵ ≈ **99.5%**.
+- **Spare copies help**, if they fail independently. Two copies that are each up 99% give 1 − 0.01 × 0.01 = 99.99%.
+- **In real life, failures are often linked.** The same bad deploy, the same config mistake or the same region outage can take out all copies at once. That's why spare copies alone aren't enough.
 
-**Techniques by failure scope:**
+**What to do for each kind of failure:**
 
-| Failure | Defence |
+| What fails | Defence |
 |---|---|
-| Process crash, memory leak | Supervisors or Kubernetes restarts, liveness probes |
-| Node loss | N+1 replicas behind a health-checked load balancer |
-| Zone loss | Zone-redundant deployments and databases (synchronous standby in another zone) |
-| Region loss | Warm standby or active-active across regions, with a rehearsed failover runbook |
-| Slow or failing dependency | Timeouts, retries with jitter and budgets, circuit breakers, bulkheads (Module 3) |
-| **Bad deploy or configuration** (the most common cause of outages) | Canary and progressive rollout, feature flags, automated rollback on SLO burn, config treated as code |
-| Data corruption or human error | Point-in-time recovery, **immutable** backups, delayed replicas. Replication faithfully copies mistakes, so it is not a backup |
-| Overload | Admission control, load shedding by priority, rate limits, autoscaling with headroom |
+| A process crashes or leaks memory | Automatic restarts (for example Kubernetes), health checks |
+| A machine dies | At least one spare copy behind a health-checked load balancer |
+| A data centre zone goes down | Run copies in several zones. Keep a synchronous database standby in another zone |
+| A whole region goes down | A standby region, with a failover plan you've practised |
+| A service you call is slow or failing | Timeouts, retries with backoff, circuit breakers, separate connection pools (Module 3) |
+| **A bad deploy or config change** (the most common cause of outages) | Release to a small slice of traffic first (canary), feature flags, automatic rollback |
+| Data gets corrupted or deleted by mistake | Point-in-time backups that can't be edited or deleted. Note that replicas copy mistakes too, so a replica is not a backup |
+| Too much traffic | Admission limits, dropping low-priority work, rate limits, autoscaling with spare room |
 
-**Disaster-recovery tiers:**
+**Disaster recovery options:**
 
-| Strategy | RTO | RPO | Cost |
+| Strategy | Time to recover | Data you might lose | Cost |
 |---|---|---|---|
-| Backup and restore | Hours to a day | Last backup (minutes with PITR) | $ |
-| Pilot light (data replicated, compute off) | Tens of minutes to hours | Seconds to minutes | $$ |
-| Warm standby (scaled-down live copy) | Minutes | Seconds | $$$ |
-| Active-active | Near zero | Near zero (per the conflict strategy) | $$$$, plus the Module 4 conflict problems |
+| Backup and restore | Hours to a day | Since the last backup (minutes with point-in-time recovery) | $ |
+| Pilot light (data copied, servers switched off) | Tens of minutes to hours | Seconds to minutes | $$ |
+| Warm standby (a smaller live copy running) | Minutes | Seconds | $$$ |
+| Active-active (full copies all serving traffic) | Almost none | Almost none, but see the conflict problems in Module 4 | $$$$ |
 
-**Health checks done right:**
+**Health checks, done right:**
 
-- **Liveness** asks "is this process wedged?" It should check almost nothing. Checking the database in liveness turns a database blip into a fleet-wide restart storm.
-- **Readiness** asks "should this pod get traffic now?" It fails during warm-up and shutdown, and *may* check critical local dependencies.
-- Beware: if readiness checks a shared database, every pod goes unready at once and the load balancer has nothing to route to. Sometimes serving a degraded response beats serving nothing.
+- **Liveness** asks "is this process stuck?" It should check almost nothing. If it checks the database, one database hiccup restarts every server at once.
+- **Readiness** asks "should this server get traffic right now?" It says no while starting up and shutting down, and it *may* check important dependencies.
+- Be careful: if every server's readiness check depends on the same database, they all go "not ready" together and the load balancer has nowhere to send traffic. Sometimes a partly working answer is better than none.
 
-**Proof, not hope:** run game days, chaos experiments (kill a zone, add latency to a dependency), and **restore drills**. A backup that has never been restored is a hypothesis. Monitor the four golden signals (latency, traffic, errors, saturation) and alert on **SLO burn rate**, not on CPU.
+**Prove it works; don't hope.** Run practice outages ("game days"), deliberately break things in a controlled way (chaos testing), and **practise restoring backups**. A backup you have never restored might not work. Watch the four golden signals (latency, traffic, errors and saturation), and alert when you're burning through your error budget, not when CPU is high.
 
-### Python: liveness vs. readiness, with warm-up and drain
+### Python: liveness vs. readiness, with warm-up and clean shutdown
 
 ```python
 import asyncio
@@ -589,7 +592,7 @@ async def readyz(response: Response) -> dict:
     return {"ready": True}
 ```
 
-On Kubernetes, pair this with a `preStop` hook (for example, sleeping 10 s) and a `terminationGracePeriodSeconds` longer than your slowest request. Load balancers need a few seconds to stop routing to a terminating pod. Without that delay, every deploy drops in-flight requests.
+On Kubernetes, add a `preStop` hook (for example, wait 10 seconds) and a shutdown grace period longer than your slowest request. Load balancers take a few seconds to stop sending traffic to a server that is shutting down. Without that wait, every deploy drops some requests.
 
 ## 0.6 Long-Running Jobs
 
@@ -631,41 +634,41 @@ stateDiagram-v2
 
 *[Open full-size diagram: Job lifecycle (SVG)](../diagrams/m0-job-lifecycle.svg)*
 
-### Theory & trade-offs
+### The idea
 
-Some work doesn't fit in a request: generating 3M statements, exporting a customer's data, re-embedding a corpus, reconciling a day's transactions, running a migration backfill. **Long-running jobs outlive the processes that run them.** Deploys, crashes, autoscaling and spot or preemptible eviction all interrupt them. The design goal is that **any job can be interrupted at any moment and resume correctly**.
+Some work is too big for one web request: making 3 million bank statements, exporting a customer's data, re-processing a document library, or running a data migration. **These jobs often run longer than the servers running them stay up.** Deploys, crashes, autoscaling and cloud machines being taken back all interrupt them. The goal is simple to state: **any job can be stopped at any moment and continue correctly later.**
 
-**The API contract: asynchronous request–reply.**
+**How the API should look (asynchronous request–reply):**
 
-1. `POST /jobs` returns **`202 Accepted`** with a `Location: /jobs/{id}` header. It accepts an idempotency key, so a retried submit doesn't start two jobs.
-2. The client polls `GET /jobs/{id}` (state, progress, result link) or receives a webhook, SSE event or email on completion.
-3. `POST /jobs/{id}/cancel` requests cooperative cancellation.
+1. `POST /jobs` replies **`202 Accepted`** with a link (`/jobs/{id}`) where the client can check on the job. The request carries an idempotency key, so sending it twice doesn't start two jobs.
+2. The client checks `GET /jobs/{id}` for status and progress, or gets notified when the job is done (webhook, SSE or email).
+3. `POST /jobs/{id}/cancel` asks the job to stop.
 
-**Execution models:**
+**Ways to run jobs:**
 
-| Model | Examples | Best for | Watch out for |
+| Option | Examples | Best for | Watch out for |
 |---|---|---|---|
-| **Task queue + workers** | Celery, RQ, Dramatiq, Azure Queue Storage / Service Bus + workers | Many short-to-medium independent tasks | Visibility timeouts, duplicate delivery, no built-in multi-step state |
-| **Database-backed queue** | PostgreSQL `FOR UPDATE SKIP LOCKED` | Moderate volume with transactional enqueue (same database as your data) | Polling load, table bloat at very high volume |
-| **Batch compute** | Kubernetes Jobs, Azure Batch, AWS Batch | Large parallel compute (rendering, ML, simulations) | Scheduling latency, cost of idle capacity |
-| **Durable workflow engines** | Temporal, Azure Durable Functions, AWS Step Functions | Multi-step processes lasting minutes to months, with retries, timers, human steps and compensations | A new programming model with determinism rules for workflow code |
-| **Data pipeline orchestrators** | Airflow, Azure Data Factory, Dagster | Scheduled DAGs of data tasks | Not built for per-user, on-demand jobs |
+| **Task queue + workers** | Celery, RQ, Azure Service Bus + workers | Many small or medium tasks | Messages delivered twice. No built-in tracking across steps |
+| **Database as the queue** | PostgreSQL with `FOR UPDATE SKIP LOCKED` | Moderate volume, when the job should be created in the same transaction as your data | Constant polling, and table growth at very high volume |
+| **Batch computing** | Kubernetes Jobs, Azure Batch | Heavy parallel computing | Slow to start. Idle machines cost money |
+| **Durable workflow engines** | Temporal, Azure Durable Functions, AWS Step Functions | Multi-step processes lasting minutes to months, with timers and human approvals | A new way of writing code, with rules to follow |
+| **Pipeline schedulers** | Airflow, Azure Data Factory | Scheduled data pipelines | Not meant for on-demand jobs per user |
 
-**The mechanics that make jobs survivable:**
+**How to make jobs survive failures:**
 
-- **Leases and heartbeats.** A worker claims a job with a time-limited lease and extends it periodically. If the worker dies, the lease expires and another worker picks the job up. Lease length trades recovery speed (short leases) against false expiry during GC pauses or slow chunks (long leases).
-- **Fencing by attempt number.** When a lease expires and a new worker claims the job, the attempt counter increments. Every heartbeat, checkpoint and completion write includes `attempt = :mine`. A stale worker that wakes up can no longer write. This is the same fencing idea as Module 1.
-- **Checkpointing.** Persist a cursor (last processed ID, file offset, page token) after each chunk, so a restart resumes instead of starting over. Checkpoint frequency trades re-done work against write overhead.
-- **Idempotent chunks.** After a crash, at most the last chunk runs twice, so every side effect must tolerate repetition: deterministic output object keys, upserts, dedupe keys on notifications.
-- **Chunking and fan-out.** Split big jobs into many small tasks (map), track completion (a counter or a barrier), then aggregate (reduce). Small tasks retry cheaply and parallelize.
-- **Cancellation is cooperative.** Check a flag at chunk boundaries. Forcibly killing work mid-chunk leaves partial side effects.
-- **Timeouts and poison jobs.** Cap attempts, retry with exponential backoff, and move exhausted jobs to a dead-letter state with an alert. One bad input must not block the queue forever.
-- **Fairness and downstream protection.** Use per-tenant concurrency limits so one customer's 1M-row export doesn't starve everyone else, and global concurrency caps that respect the capacity of the databases and APIs the jobs call.
-- **Graceful shutdown.** On `SIGTERM`, stop claiming, finish or checkpoint the current chunk, and release the lease. Set the orchestrator's grace period to cover one chunk.
+- **Leases and heartbeats.** A worker "borrows" a job for a limited time (a lease) and keeps renewing it (a heartbeat). If the worker dies, the lease runs out and another worker takes over. Short leases recover faster. Long leases are less likely to expire by mistake during a slow step.
+- **Attempt numbers as fencing.** Each time a job is taken over, its attempt number goes up. Every progress update includes "attempt = mine". An old worker that wakes up can no longer overwrite anything. This is the same fencing idea as in Module 1.
+- **Checkpoints.** Save your position after each chunk of work (for example, "last account processed"). A restarted job continues from there instead of starting over. Saving more often means less repeated work but more writes.
+- **Every chunk must be safe to repeat.** After a crash, the last chunk may run twice. So use fixed file names, upserts, and duplicate checks on notifications.
+- **Split big jobs.** Break them into many small tasks that run in parallel, track when they're all done, then combine the results. Small tasks are cheap to retry.
+- **Cancelling is polite.** The job checks a "please stop" flag between chunks. Killing it mid-chunk can leave half-finished changes.
+- **Limit retries.** Retry with growing waits, and after a set number of attempts, move the job to a "failed" (dead-letter) state and alert someone. One bad input must never block the queue forever.
+- **Be fair and protect other systems.** Limit how many jobs each customer can run at once, so one huge export doesn't block everyone else. Cap total concurrency so jobs don't overload the databases and APIs they call.
+- **Clean shutdown.** When the server is told to stop (`SIGTERM`), stop taking new work, finish or checkpoint the current chunk, and release the lease.
 
-**A Celery-specific trap:** with Redis or SQS brokers, a task still running when the broker's **visibility timeout** expires is redelivered to another worker, and you now have two copies running. Set the visibility timeout above the longest task runtime, use `acks_late=True`, and keep tasks short by chunking.
+**Celery trap:** with Redis or SQS brokers, if a task runs longer than the broker's **visibility timeout**, the broker assumes the worker died and gives the task to another worker. Now two copies are running. Set that timeout longer than your longest task, use `acks_late=True`, and split long tasks into chunks.
 
-### Python: a PostgreSQL-backed job runner with leases, fencing and checkpoints
+### Python: a PostgreSQL job runner with leases, fencing and checkpoints
 
 ```sql
 CREATE TABLE jobs (
@@ -772,24 +775,24 @@ async def generate_statements(payload: dict, checkpoint: dict | None, save, canc
     return "cancelled"
 ```
 
-Operational notes:
+Notes:
 
-- A small **reaper** marks jobs as `failed` when their lease expired *and* attempts are exhausted, because the claim query skips them.
-- Run the reaper and `run_one` in a loop with backoff when the queue is empty. Use `LISTEN/NOTIFY` to wake idle workers instead of tight polling.
-- **Choosing a model:** past roughly thousands of jobs per second, or once jobs become multi-step with timers and human approvals, move to a dedicated broker or a durable workflow engine (Temporal or Durable Functions). The lease, fence and checkpoint principles carry over unchanged.
+- Run a small cleanup job (a "reaper") that marks jobs as `failed` when their lease expired *and* they have no attempts left. The claim query skips those jobs.
+- Loop `run_one` with a pause when there's no work. PostgreSQL's `LISTEN/NOTIFY` can wake workers up instead of constant polling.
+- **When to switch:** at thousands of jobs per second, or when jobs have many steps with timers and human approvals, move to a dedicated queue or a workflow engine such as Temporal. The same ideas (leases, fencing and checkpoints) still apply.
 
 ## 0.7 Case Study: A Digital Bank's Mobile Backend, Using All Six
 
-**Scenario:** a Canadian digital bank with 3M customers. The morning peak is 5,000 account-summary reads/s and 800 transfers/s. Customers expect instant balance updates and push notifications. Monthly statements must be generated for every account. SLOs are 99.95% for login and balance and 99.9% for statements and exports.
+**Scenario:** a Canadian online bank with 3 million customers. At the morning peak there are 5,000 account-summary reads and 800 money transfers every second. Customers expect balances to update instantly, with push notifications. Every account needs a monthly statement. Targets: 99.95% uptime for login and balance, and 99.9% for statements and exports.
 
-| Concern | Decision | Why | Trade-off accepted |
+| Concern | What we do | Why | What we accept |
 |---|---|---|---|
-| **Scale reads** | Account summaries served from a Redis read model (single-flight, jittered TTLs). Transaction history from replicas | 5,000 reads/s at a 95% hit ratio leaves 250/s for the database | Summaries can be seconds stale, which is labelled "as of" in the app |
-| **Split reads and writes** | Staleness budgets per endpoint. Authorization reads the primary. The post-transfer view uses a consistency token | Correctness where money moves, scale everywhere else | Routing logic in the application, and token plumbing |
-| **Scale writes** | Ledger partitioned by account (Module 1). Card-network notifications are accepted into a log and applied in micro-batches | 800 TPS sustained with 5× burst headroom | Asynchronous status for some operations |
-| **Real-time data** | Outbox → event bus → push gateways (WebSocket) with sequence numbers and snapshot resync. Mobile push for critical alerts, plus a durable in-app inbox | Instant UX without making the socket the source of truth | A resync path must be built and tested |
-| **Reliability** | Zone-redundant everything, a warm standby region, canary deploys gated on SLO burn, restore drills quarterly | Most outages are deploys and dependencies, not hardware | Standby cost. Slower but safer releases |
-| **Long-running jobs** | Statement generation as a fan-out of 500-account chunks with leases, checkpoints and idempotent PDF keys | 3M statements × ~200 ms ≈ 167 CPU-hours, so ~50 four-core workers finish in under an hour | A job platform to operate |
+| **Scale reads** | Account summaries come from a Redis read model (with single-flight and random TTLs). History comes from replicas | 5,000 reads/s at a 95% hit ratio leaves only 250/s for the database | Summaries can be seconds old, so the app shows "as of" times |
+| **Split reads and writes** | A freshness budget per endpoint. Approvals read the primary. The screen after a transfer uses a token | Exact where money moves, scalable everywhere else | Routing logic in the app, and passing tokens around |
+| **Scale writes** | The ledger is split by account (Module 1). Card network updates go into a queue and are saved in batches | 800 transfers/s, with room for 5× bursts | Some results arrive a moment later |
+| **Real-time data** | Outbox → event bus → WebSocket servers with numbered messages and snapshot reload. Mobile push for important alerts, plus an inbox in the app | Instant updates without trusting the socket to never drop anything | We must build and test the reload path |
+| **Reliability** | Every part in several zones, a standby region, canary deploys that stop when errors rise, and quarterly restore tests | Most outages come from deploys and dependencies, not hardware | Standby costs money. Releases are a bit slower |
+| **Long-running jobs** | Statements are made in chunks of 500 accounts, with leases, checkpoints and fixed PDF file names | 3 million statements × ~200 ms ≈ 167 CPU-hours, so 50 four-core workers finish in under an hour | We need to run a job platform |
 
 ```mermaid
 flowchart LR
@@ -814,43 +817,43 @@ flowchart LR
 
 *[Open full-size diagram: Digital bank backend - all six concerns together (SVG)](../diagrams/m0-digital-bank-backend-all-six-concerns-together.svg)*
 
-## 0.8 Animation Blueprints
+## 0.8 Animation Plans
 
-### A. Cache stampede, then single-flight
+### A. A cache stampede, then single-flight
 
-**Scene setup:** 30 small request dots on the left, a cache box in the middle (a key tile `rates:today` with a draining TTL bar), a database box on the right with a **load gauge**, and a latency meter at the bottom.
+**Scene:** 30 small dots (requests) on the left, a cache box in the middle holding one item `rates:today` with a shrinking TTL bar, a database on the right with a load meter, and a response-time meter at the bottom.
 
-| Time | Beat | Visual | Manim primitives |
+| Time | Step | What you see | Manim tools |
 |---|---|---|---|
-| 0:00–0:04 | Warm cache | Dots bounce off the cache tile and return green. The database gauge stays near zero | `MoveAlongPath`, `Indicate(tile)` |
-| 0:04–0:07 | TTL expires | The TTL bar hits zero and the tile greys out | `ValueTracker` driving a `Rectangle` width |
-| 0:07–0:12 | **Stampede** | All 30 dots miss at once and stream to the database. The gauge swings into red, the latency meter spikes, and some dots turn red (timeouts) | `LaggedStart` of 30 arrows, `Rotate(needle)` |
-| 0:12–0:14 | Rewind | Rewind to 0:04. Caption: *Same traffic, single-flight + stale-while-revalidate* | `Restore` |
-| 0:14–0:20 | **Coalesced** | On expiry the tile turns amber (*stale*). One dot goes to the database while the other 29 are served the stale value immediately. The gauge barely moves | One `GrowArrow` to the DB, 29 short bounces |
-| 0:20–0:23 | Refresh lands | The single loader returns, the tile turns green with a new, slightly jittered TTL. Neighbouring keys show different TTL bar lengths | `Transform`, varied bar widths |
-| 0:23–0:26 | Recap | *One loader per key. Serve stale while refreshing. Jitter expiries* | `Write` |
+| 0:00–0:04 | Cache is warm | Dots bounce off the cache and come back green. The database meter stays near zero | `MoveAlongPath`, `Indicate` |
+| 0:04–0:07 | Item expires | The TTL bar reaches zero and the item turns grey | `ValueTracker` controlling the bar width |
+| 0:07–0:12 | **Stampede** | All 30 dots miss at once and rush to the database. Its meter goes red, response time spikes, and some dots turn red (timeouts) | `LaggedStart` of 30 arrows, rotating needle |
+| 0:12–0:14 | Rewind | Back to 0:04. Caption: *Same traffic, with single-flight and stale-while-refresh* | `Restore` |
+| 0:14–0:20 | **Coalesced** | On expiry the item turns amber (*old but usable*). One dot goes to the database, and the other 29 get the old value right away. The database meter barely moves | One arrow to the database, 29 short bounces |
+| 0:20–0:23 | Refreshed | The new value arrives and the item turns green with a slightly random new TTL. Nearby items show different TTL lengths | `Transform`, varied bar widths |
+| 0:23–0:26 | Summary | *One loader per item. Serve old while refreshing. Randomize expiry times* | `Write` |
 
-### B. A long-running job survives a crash
+### B. A long job survives a crash
 
-**Scene setup:** a horizontal progress track of 20 chunks, a job card (`attempt 1`, `lease` ring, `checkpoint: —`), two workers (W1, W2), and an output bucket.
+**Scene:** a progress track of 20 chunks, a job card (`attempt 1`, a lease ring, `checkpoint: —`), two workers (W1 and W2), and a bucket for output files.
 
-| Time | Beat | Visual | Manim primitives |
+| Time | Step | What you see | Manim tools |
 |---|---|---|---|
-| 0:00–0:05 | Claim and run | W1 claims the job. The lease ring starts, and chunks light up one by one while PDFs drop into the bucket | `FadeIn`, `LaggedStart` |
-| 0:05–0:08 | Heartbeat and checkpoint | After every chunk, a checkpoint tag moves along the track (`after_account=…`). The lease ring refills on each heartbeat | `MoveToTarget(tag)`, ring refill |
-| 0:08–0:10 | **Crash** | W1 is struck by a lightning bolt mid-chunk 9. The heartbeat stops and the lease ring drains | `Create(bolt)`, `FadeToColor(GREY)` |
-| 0:10–0:14 | Reclaim | The lease hits zero. W2 claims the job and the card shows `attempt 2`. W2 **starts from the checkpoint after chunk 8**, not from zero. Chunk 9 is redone, and its PDF overwrites the identical object in the bucket (*idempotent*) | `Transform(card)`, `Indicate(chunk9)` |
-| 0:14–0:18 | Zombie write | W1 recovers and tries to write a checkpoint stamped `attempt 1`. It bounces off the job card: *0 rows updated, fenced* | Red `Flash`, the arrow shatters |
-| 0:18–0:22 | Complete | W2 finishes chunk 20. The card turns green: *succeeded, 1 chunk re-done out of 20* | `Circumscribe` |
+| 0:00–0:05 | Start | W1 takes the job. Its lease ring starts, chunks light up one by one, and PDFs drop into the bucket | `FadeIn`, `LaggedStart` |
+| 0:05–0:08 | Heartbeat and checkpoint | After each chunk, a checkpoint tag moves along the track. The lease ring refills with each heartbeat | Moving tag, ring refill |
+| 0:08–0:10 | **Crash** | Lightning hits W1 in the middle of chunk 9. Heartbeats stop and the lease ring runs down | `Create(bolt)`, turn grey |
+| 0:10–0:14 | Takeover | The lease runs out. W2 takes the job, which now shows `attempt 2`. W2 **starts after chunk 8**, not from zero. Chunk 9 runs again and its PDF replaces the identical file (*safe to repeat*) | `Transform`, `Indicate` |
+| 0:14–0:18 | Old worker blocked | W1 wakes up and tries to save progress as `attempt 1`. The write bounces off: *0 rows updated* | Red `Flash`, arrow breaks |
+| 0:18–0:22 | Done | W2 finishes chunk 20. The card turns green: *done, only 1 of 20 chunks repeated* | `Circumscribe` |
 
-## 0.9 Staff-level Review Questions
+## 0.9 Review Questions
 
-- For each endpoint, what is the written staleness budget, and which store serves it?
-- What happens to database load at a 50% cache hit ratio (after a flush), and can the database survive it?
-- Which entity defines write ordering, and what happens when one key receives 100× the average traffic?
-- If a push message is lost, how does the client find out, and how does it recover?
-- Which failure scenario has the longest untested recovery path, and when was the last restore drill?
-- Can every long-running job be killed at any instant and resume correctly? What proves it?
+- For each endpoint, how stale is data allowed to be, and where is it read from?
+- If the cache is flushed and the hit ratio drops to 50%, can the database survive?
+- Which key decides the order of writes, and what happens if one key gets 100 times normal traffic?
+- If a push message is lost, how does the app notice, and how does it recover?
+- Which failure has a recovery path you've never tested? When did you last restore a backup?
+- Can every long job be killed at any moment and continue correctly? How do you know?
 
 ---
 

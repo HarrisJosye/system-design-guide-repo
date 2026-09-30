@@ -2,17 +2,17 @@
 
 *Industry: Core Banking Modernization*
 
-## 6.1 Core Theory & Trade-offs
+## 6.1 Ideas & Trade-offs
 
-### Why migrations of systems of record are different
+### Why replacing a bank's core system is different
 
-Replacing a core banking platform (for example, moving deposits off a mainframe COBOL/DB2 core onto a cloud-native ledger like Module 1's) is among the highest-risk changes a bank makes:
+Replacing a core banking system, for example moving deposits off an old mainframe (COBOL/DB2) onto a modern cloud ledger like the one in Module 1, is one of the riskiest changes a bank can make:
 
-- The system has decades of undocumented behaviour: interest rounding quirks, fee waivers coded for one product in 1998, cut-off time conventions.
-- It runs periodic processes that only execute at month-end, quarter-end or year-end.
-- A wrong balance is not a bug report. It is a regulatory event and a customer-trust event.
+- The old system has decades of **undocumented behaviour**: rounding quirks, a fee waiver coded for one product in 1998, particular cut-off times.
+- Some processes run **only at month-end, quarter-end or year-end**, so you may not see them for months.
+- A wrong balance isn't just a bug. It's a **regulatory problem** and a **trust problem**.
 
-"Big-bang" core migrations have failed publicly. The UK's TSB migration in 2018 is the widely studied example. The patterns in this module exist to **replace one large, irreversible leap with many small, verified, reversible steps**.
+"Big-bang" migrations (switching everything at once) have failed publicly. The UK bank TSB's 2018 migration is the best-known example. The patterns in this module replace **one big, irreversible jump with many small, checked steps that can be undone**.
 
 ### The migration pattern family
 
@@ -31,14 +31,14 @@ flowchart LR
 
 | Pattern | What it does | When to use | Main risk |
 |---|---|---|---|
-| **Strangler fig** | Route one capability at a time to the new system behind a façade | Decomposable functionality (statements, notifications, fee calculation) | Long tail of capabilities that are hard to extract |
-| **Branch by abstraction** | Introduce an interface inside the old code base, then swap the implementation | When you own the legacy code | Legacy code may be untouchable |
-| **Shadow traffic / dark launch** | Copy live requests to the new system and discard its responses | Read paths, calculations, APIs | Side effects leaking out of the shadow system |
-| **Parallel run** | Both systems process *the same inputs*. Outputs are compared. Legacy stays the system of record | Anything where correctness must be *proven*: balances, interest, fees | The cost of running two systems, and of triaging their differences |
-| **Reverse parallel** | After cutover, the **new** system is the system of record and legacy runs in shadow for a few cycles | To keep a rollback path | Needs a reverse data flow, and discipline about when it ends |
-| **Cohort cutover** | Move accounts or customers in waves: staff, then 1%, 10%, 50%, all | Almost always, as the cutover mechanism | Customers split across two systems (joint accounts, transfers between cohorts) |
+| **Strangler fig** | A front layer sends one feature at a time to the new system | Features that can be separated (statements, notifications, fee calculations) | Some features are very hard to pull out |
+| **Branch by abstraction** | Add an interface inside the old code, then swap what's behind it | When you can change the old code | The old code may be untouchable |
+| **Shadow traffic** | Copy live requests to the new system and ignore its answers | Read-only features, calculations, APIs | The shadow system accidentally sending real emails or payments |
+| **Parallel run** | Both systems process *the same inputs*, and their outputs are compared. The old system stays in charge | When correctness must be *proven*: balances, interest, fees | Running two systems costs money, and investigating differences takes time |
+| **Reverse parallel** | After switching, the **new** system is in charge and the old one runs alongside for a few cycles | To keep a way back | Needs data flowing back to the old system, and discipline about when to stop |
+| **Cohort cutover** | Move accounts in groups: staff first, then 1%, 10%, 50% and 100% of customers | Almost always, as the way to switch | Customers split across two systems (joint accounts, transfers between groups) |
 
-For a core ledger these are **combined, not chosen between**: shadow for read APIs, parallel run for balances and batch processes, cohort cutover with reverse parallel for the switch.
+For a bank ledger you **combine** these: shadow traffic for read APIs, parallel run for balances and batch jobs, and cohort cutover with reverse parallel for the switch itself.
 
 ### Parallel run modes
 
@@ -55,11 +55,11 @@ flowchart LR
 
 *[Open full-size diagram: Parallel run modes over time (SVG)](../diagrams/m6-parallel-run-modes-over-time.svg)*
 
-1. **Mirror (shadow) run.** The new system consumes a copy of every input and builds its own state. Nothing it produces leaves the building. Its outputs (balances, postings, interest accruals) are compared with legacy's.
-2. **Full parallel run, including batch.** The new system also runs end-of-day, month-end interest capitalization, fee assessment and statement generation, and those outputs are compared too. Minimum duration is **at least one full quarter, including a month-end and quarter-end**. If tax reporting is in scope (in Canada, T5 slips for interest income), a year-end.
-3. **Reverse parallel.** After a cohort moves, the new system is authoritative. Its changes flow back to legacy so that legacy stays current, and legacy's outputs are compared in the other direction. Rollback remains possible until the declared **point of no return**.
+1. **Mirror run.** The new system receives a copy of every input and builds its own balances. Nothing it produces leaves the building. Its outputs (balances, postings, interest) are compared with the old system's.
+2. **Full parallel run.** The new system also runs end-of-day jobs, month-end interest, fees and statements, and those are compared too. **At minimum run for one full quarter, including a month-end and a quarter-end.** If tax reporting is involved (in Canada, T5 slips for interest income), include a year-end.
+3. **Reverse parallel.** After a group of accounts moves, the new system is in charge. Its changes flow back to the old system so the old one stays up to date, and outputs are compared in the other direction. You can still go back, until the declared **point of no return**.
 
-### The integration point: capture inputs, don't dual-write
+### The integration point: capture inputs, don't write to both
 
 ```mermaid
 flowchart LR
@@ -81,16 +81,16 @@ flowchart LR
 
 *[Open full-size diagram: Dual-write vs ordered input log (SVG)](../diagrams/m6-dual-write-vs-ordered-input-log.svg)*
 
-**Dual-writing from channels to both systems is the classic mistake.** With no distributed transaction, a write that succeeds on one side and fails on the other diverges silently. Retries arrive in different orders. The systems then disagree for reasons that have nothing to do with their logic, and the diff triage team drowns in noise.
+**Writing to both systems from each channel ("dual-write") is the classic mistake.** There's no shared transaction, so a write can succeed on one side and fail on the other. Retries arrive in different orders. The systems then disagree for reasons that have nothing to do with their logic, and the team investigating differences drowns in noise.
 
-**Principal answer: make an ordered input log the integration point.**
+**Better: use one ordered list of inputs (a log) that both systems read.**
 
-- Capture every input that changes state (payments, deposits, card postings, account maintenance, rate changes) **into a durable ordered log** (Kafka/Event Hubs), in the order legacy processed it.
-- Legacy remains the system of record and processes inputs as it always has. The capture is either **before** it (channels publish to the log, and a legacy adapter consumes) or **after** it via CDC from legacy's database (e.g. Db2 log-based capture).
-- The new system consumes **the same log in the same order**, so it is deterministic by construction. Given the same starting state and the same inputs, a correct new system must produce the same outputs.
-- **Capturing after legacy's commit order is usually safer.** The log then reflects what legacy *actually* did, including its rejections, instead of what the channels asked for.
+- Record every input that changes data (payments, deposits, card transactions, account changes, rate changes) **in a durable ordered log** (Kafka or Event Hubs), in the order the old system processed them.
+- The old system stays in charge and works as always. Inputs are captured either **before** it (channels publish to the log and an adapter feeds the old system) or **after** it, by reading its database changes (CDC, for example log-based capture on Db2).
+- The new system reads **the same log in the same order**. With the same starting data and the same inputs, a correct new system must produce the same results.
+- **Capturing after the old system's commits is usually safer.** The log then shows what the old system *actually did*, including rejections, not just what channels asked for.
 
-### Why outputs differ, and why that is the whole job
+### Why the outputs differ, and why sorting that out is the whole job
 
 ```mermaid
 flowchart LR
@@ -114,20 +114,20 @@ flowchart LR
 
 *[Open full-size diagram: Diff classification pipeline (SVG)](../diagrams/m6-diff-classification-pipeline.svg)*
 
-Most differences are not defects in the new system. Classify every difference into one of these buckets:
+Most differences aren't bugs in the new system. Sort every difference into one of these buckets:
 
-| Class | Example | Handling |
+| Kind of difference | Example | What to do |
 |---|---|---|
-| **Non-deterministic noise** | Generated IDs, timestamps, correlation IDs | Exclude or normalize before comparison |
-| **Representation** | Padding, case, date formats, sign conventions (debit negative vs. separate DR/CR columns) | Normalize, carefully |
-| **Precision and rounding** | Banker's rounding (half-even) vs. half-up. Accruing interest at 5 decimal places vs. rounding daily to cents | Compare at the contractual precision. **Never hide sub-cent accrual differences**, because they compound over a year |
-| **Convention** | Day-count basis (Actual/365 vs. Actual/360 vs. 30/360), leap years, business-date vs. calendar-date cut-offs, time zones | Encode the legacy convention explicitly. An intentional change is a product decision |
-| **Timing** | A transaction posted just after a cut-off on one side and just before on the other | Mark as *timing* and re-compare after the next cycle. It must resolve itself, or it becomes a break |
-| **Known differences** | An approved intentional change, or a legacy bug you've decided not to reproduce | A rule with a ticket, an owner and an expiry date |
-| **Data migration defects** | A wrong opening balance or product mapping for migrated accounts | Fix the migration and reload that account |
-| **Genuine breaks** | Anything else | Triage, root-cause, fix, re-run |
+| **Random noise** | Generated IDs, timestamps, tracking IDs | Ignore or normalize before comparing |
+| **Format** | Padding, upper/lower case, date formats, signs (negative debits vs. separate DR/CR columns) | Normalize, carefully |
+| **Rounding and precision** | Banker's rounding (half-even) vs. normal rounding (half-up). Interest kept to 5 decimals vs. rounded to cents daily | Compare at the precision the product contract uses. **Never hide sub-cent interest differences**, because they grow over a year |
+| **Conventions** | How days are counted (Actual/365, Actual/360, 30/360), leap years, business date vs. calendar date, time zones | Write the old system's rule down explicitly. Changing it on purpose is a product decision |
+| **Timing** | A payment just after a cut-off on one side and just before it on the other | Mark as *timing* and check again after the next cycle. It must sort itself out, or it becomes a break |
+| **Known differences** | An approved change, or an old bug you decided not to copy | A rule with a ticket, an owner and an expiry date |
+| **Data migration errors** | Wrong opening balance or product mapping for migrated accounts | Fix the migration and reload that account |
+| **Real breaks** | Anything else | Investigate, find the cause, fix it, re-run |
 
-The **diff platform is a product**: a store of every difference with its class, trend dashboards, drill-down to the inputs that produced it, and assignment to owners. Exit criteria are defined on it.
+The **difference tracker is a product in its own right**: it stores every difference with its type, shows trends, lets you drill down to the inputs behind it, and assigns an owner. The rules for finishing the migration are defined using it.
 
 ### Side-effect isolation (egress sandboxing)
 
@@ -145,13 +145,13 @@ flowchart LR
 
 *[Open full-size diagram: Egress adapter modes (SVG)](../diagrams/m6-egress-adapter-modes.svg)*
 
-The new system in a parallel run must **never** emit real side effects: no payments to clearing, no files to card networks, no customer emails or SMS, no credit bureau updates. Put every egress behind an adapter with three modes:
+During a parallel run, the new system must **never** do anything real: no payments to clearing, no files to card networks, no customer emails or texts, no credit bureau updates. Put every outgoing connection behind an adapter with three modes:
 
-- **Record** (parallel run): capture what *would* have been sent, for comparison with what legacy actually sent.
-- **Live** (after cutover).
+- **Record** (during the parallel run): save what *would* have been sent, to compare with what the old system really sent.
+- **Live** (after switching).
 - **Block** (the default).
 
-Test the sandbox itself. A misconfigured adapter that sends duplicate payments during a "harmless" shadow run is a real incident.
+Test the blocking too. A misconfigured adapter that sends duplicate payments during a "harmless" shadow run is a real incident.
 
 ### Cutover, rollback and the point of no return
 
@@ -173,22 +173,26 @@ flowchart LR
 
 *[Open full-size diagram: Cohort cutover with rollback (SVG)](../diagrams/m6-cohort-cutover-with-rollback.svg)*
 
-- **Routing.** An account-level **routing directory** (the same idea as Module 4's tenant directory) says which system is authoritative for each account, with an **epoch** that fences stale writers.
-- **Cohort flip.** Briefly freeze the cohort's inputs, confirm both systems agree for those accounts, flip the directory entries (incrementing the epoch), enable reverse sync, and resume.
-- **Relationships across cohorts.** Joint accounts, sweeps and overdraft links between accounts must move together. Build a **dependency graph** of accounts and migrate connected components.
-- **Rollback.** While reverse sync runs and reverse-parallel comparisons are clean, rollback means flipping the directory back. Define the **point of no return** explicitly: the moment legacy stops being kept current (for example, legacy licence termination or schema decommissioning). Past it, recovery means fixing forward.
+- **Routing.** An account-level **routing directory**, like the customer directory in Module 4, says which system is in charge of each account, with an **epoch** that blocks old writers.
+- **Switching a group:**
+  1. Briefly pause that group's inputs.
+  2. Confirm both systems agree for those accounts.
+  3. Switch their directory entries and increase the epoch.
+  4. Turn on reverse sync, and continue.
+- **Linked accounts.** Joint accounts, automatic transfers (sweeps) and overdraft links must move together. Map which accounts are connected, and move each connected group as one.
+- **Going back.** While reverse sync is running and comparisons are clean, going back just means switching the directory back. Decide the **point of no return** explicitly: the moment the old system stops being kept up to date (for example, when its licence ends). After that, you can only fix forward.
 
-### Exit criteria (example)
+### Rules for finishing (example)
 
-- N consecutive business days (commonly 20 or more) with **zero unexplained breaks** on balances and postings.
-- Month-end and quarter-end batch outputs matched, including interest capitalization and fees.
-- Performance at production volume with headroom (batch windows met, online p99 met).
-- Every known-difference rule approved by the product owner, with customer-impact assessment.
-- Reconciliation to the general ledger clean. Regulators or auditors briefed, as your jurisdiction requires.
+- At least 20 business days in a row with **zero unexplained differences** in balances and postings.
+- Month-end and quarter-end results matched, including interest and fees.
+- Performance at full volume with spare room (batch jobs finish in time, and online requests are fast enough).
+- Every known-difference rule approved by the product owner, with the customer impact assessed.
+- The general ledger reconciles cleanly, and regulators or auditors have been briefed if required.
 
-## 6.2 Python in Practice
+## 6.2 Python
 
-### A comparator: normalize, compare at contractual precision, classify
+### A comparator: clean up, compare at the right precision, and sort differences
 
 ```python
 from __future__ import annotations
@@ -278,12 +282,12 @@ def compare_account(
     return diffs
 ```
 
-The design choices are deliberate:
+Why it's built this way:
 
-- **Known differences expire.** Otherwise the rule set becomes a permanent place to hide defects.
-- **Timing differences must resolve.** A companion job re-compares yesterday's timing diffs and escalates any that persist to *break*.
-- **Compare canonical outputs, not screens.** Use a common schema for balances, postings and accruals, produced by an adapter on each side. The legacy adapter is often the hardest code in the programme.
-- **Scale:** 4M accounts × a few dozen fields per day is a straightforward partitioned batch job (Spark, or Python workers partitioned by account range). For the intraday posting stream, run the comparison in streaming mode, keyed by account and ordered by input sequence number.
+- **Known-difference rules expire.** Otherwise they become a permanent place to hide bugs.
+- **Timing differences must sort themselves out.** A companion job re-checks yesterday's timing differences and turns any that remain into *breaks*.
+- **Compare a common format, not screens.** Both sides produce balances, postings and interest in one shared layout, using an adapter on each side. The adapter for the old system is often the hardest code in the whole programme.
+- **Scale:** 4M accounts × a few dozen fields per day is a straightforward batch job, split by account range (Spark, or Python workers). For postings during the day, compare in streaming mode, grouped by account and ordered by input sequence number.
 
 ### A shadow tap for read APIs and pure calculations
 
@@ -330,39 +334,39 @@ class ShadowTap:
                 self.dropped += 1
 ```
 
-In the handler, the legacy call happens first and its response is returned. Only then does the handler call `tap.fire(...)`. The caller never waits on, and is never affected by, the new system. Track `dropped` as a metric, because a shadow run that silently samples 2% of traffic proves far less than it appears to.
+In the request handler, call the old system first and return its answer. Only then call `tap.fire(...)`. The caller never waits for the new system and is never affected by it. Track `dropped` as a metric: a shadow run that quietly samples only 2% of traffic proves much less than it seems.
 
-## 6.3 Case Study: Migrating Retail Deposits Off a Mainframe Core
+## 6.3 Case Study: Moving Retail Deposits Off a Mainframe
 
-**Scenario:** a mid-size Canadian bank with 4M retail deposit accounts (chequing, savings, GICs) on a mainframe core with nightly batch (interest accrual, fee assessment, statements) and a nightly general-ledger feed. The target is a cloud-native ledger built on the Module 1 design. Constraints: no customer-visible downtime beyond a short planned window per cohort, and the ability to roll back each cohort.
+**Scenario:** a mid-size Canadian bank with 4 million retail deposit accounts (chequing, savings, GICs) on a mainframe with nightly batch jobs (interest, fees, statements) and a nightly general-ledger feed. The target is a cloud ledger built like Module 1. Limits: no customer-visible downtime beyond a short planned window per group, and the ability to move each group back.
 
-### Programme phases
+### Project phases
 
-| Phase | What happens | Exit gate |
+| Phase | What happens | Done when |
 |---|---|---|
-| **0. Capture** | Build the ordered input log from legacy (CDC on the core database plus the channel feeds). Build canonical output adapters for both systems. Stand up the diff platform | The log replays a historical day on legacy's own data and reproduces its end-of-day balances |
-| **1. Initial load** | Snapshot migration of accounts, balances, holds, rates and product mappings into the new ledger. The CDC stream catches it up. Build the legacy-to-new **ID crosswalk** | Opening balances reconcile for 100% of accounts, and the total reconciles to the GL |
-| **2. Mirror run** | The new ledger consumes the live input log and builds balances intraday. Daily balance and posting comparisons | Break rate falling. All diff classes understood |
-| **3. Full parallel** | The new system also runs EOD, month-end and quarter-end batch processes. Compare interest, fees, statements (as documents *and* data) and the GL feed | 20+ clean business days, including month-end and quarter-end, and the batch window met at volume |
-| **4. Cohort cutover** | Employees' accounts first, then 1%, 5%, 25%, 100%, moving connected components of related accounts together. Flip the routing directory (with epoch). Reverse sync to legacy | Each cohort clean in reverse parallel for 2+ cycles before the next one moves |
-| **5. Point of no return** | Declare the end of reverse sync once all cohorts are stable through a month-end | Sign-off by product, risk, finance and technology |
-| **6. Decommission** | Archive legacy data under retention policy, keeping read access for audit and disputes | Records management and audit sign-off |
+| **0. Capture** | Build the ordered input log from the old system (CDC on its database plus channel feeds). Build output adapters for both systems. Set up the difference tracker | Replaying a past day on the old system's own data reproduces its end-of-day balances |
+| **1. Initial load** | Copy accounts, balances, holds, rates and product mappings into the new ledger, then let CDC catch up. Build the **ID mapping table** (old account number → new ID) | Opening balances match for 100% of accounts, and the total matches the general ledger |
+| **2. Mirror run** | The new ledger reads the live input log and builds balances during the day. Balances and postings are compared daily | The break rate keeps falling, and every kind of difference is understood |
+| **3. Full parallel** | The new system also runs end-of-day, month-end and quarter-end jobs. Interest, fees, statements (as documents *and* data) and the general-ledger feed are compared | 20+ clean business days including month-end and quarter-end, and batch jobs finish in time at full volume |
+| **4. Switch groups** | Staff accounts first, then 1%, 5%, 25% and 100%, moving linked accounts together. Switch the routing directory (with epoch) and turn on reverse sync | Each group is clean in reverse parallel for 2+ cycles before the next one moves |
+| **5. Point of no return** | Declare the end of reverse sync once all groups are stable through a month-end | Product, risk, finance and technology all sign off |
+| **6. Shut down the old system** | Archive old data under retention rules, keeping read access for audits and disputes | Records management and audit sign off |
 
-### Capacity and effort realities
+### Size and effort
 
-- **Daily comparison volume:** 4M accounts × ~30 canonical fields ≈ 120M field comparisons per day, plus intraday postings (say 20M/day). That is a routine partitioned batch job, *but the triage load is the real constraint*. Even a 0.01% break rate means 400 account-level breaks per day to explain.
-- **The break-rate curve** typically falls steeply in the first weeks (normalization and convention fixes), plateaus (real business-logic gaps), then spikes at the first month-end (batch processes seen for the first time). Plan staffing around that shape.
-- **Cost of running two systems:** budget for months of dual infrastructure and licensing. Shortening parallel run to save money is the most common way these programmes take on unpriced risk.
+- **Daily comparisons:** 4M accounts × ~30 fields ≈ 120 million field comparisons a day, plus ~20 million postings. That's a routine batch job, **but investigating differences is the real bottleneck**. Even a 0.01% break rate means 400 accounts a day to explain.
+- **How the break rate usually moves:** it drops fast in the first weeks (formatting and rounding fixes), then flattens (real logic gaps), then jumps at the first month-end (batch jobs seen for the first time). Plan staff around that shape.
+- **Cost of running two systems:** budget for months of double infrastructure and licences. Cutting the parallel run short to save money is the most common way these projects take on hidden risk.
 
-### Architecture decisions
+### Design decisions
 
-- **Legacy remains the system of record until each cohort flips.** Everything else is a derived view.
-- **Account-level routing directory** with epochs, used by channels (online banking, branch, payments hub) to route writes. It is cached, highly available, and changed only by the cutover orchestrator.
-- **Reverse sync after cutover:** the new ledger's postings, published through its outbox, are applied to legacy by an adapter, so legacy stays current for rollback and reverse-parallel comparison.
-- **Egress adapters in record mode** for every external interface: clearing, card networks, statements, notifications, the credit bureau, and the regulatory reporting feeds.
-- **Governance:** a known-difference board with product and risk owners, and customer-impact assessment for every intentional behaviour change. An interest calculation that is "more correct" in the new system can still change what a customer is paid, so treat it as a product change with customer communication.
+- **The old system stays in charge until each group switches.** Everything else is a copy.
+- **An account-level routing directory** with epochs, which every channel (online banking, branch, payments) uses to send writes to the right system. It's cached, always available, and changed only by the cutover tool.
+- **Reverse sync after switching.** The new ledger's postings, published through its outbox, are applied to the old system by an adapter. That keeps the old system current for going back and for reverse comparisons.
+- **Every outgoing connection in "record" mode** during the parallel run: clearing, card networks, statements, notifications, the credit bureau and regulatory reports.
+- **Governance:** a known-difference board with product and risk owners, and a customer-impact review for every intentional change. An interest calculation that is "more correct" in the new system still changes what customers are paid, so treat it as a product change and tell customers.
 
-## 6.4 Mermaid: Parallel-Run Architecture
+## 6.4 Diagram: Parallel-Run Architecture
 
 ```mermaid
 flowchart LR
@@ -399,7 +403,7 @@ flowchart LR
 
 *[Open full-size diagram: Parallel-run architecture (SVG)](../diagrams/m6-parallel-run-architecture.svg)*
 
-And the lifecycle of a single account through the migration:
+The journey of one account through the migration:
 
 ```mermaid
 stateDiagram-v2
@@ -417,36 +421,36 @@ stateDiagram-v2
 
 *[Open full-size diagram: Account migration lifecycle (SVG)](../diagrams/m6-account-migration-lifecycle.svg)*
 
-## 6.5 Animation Blueprint: Two Systems, One Input Stream, and a Reversible Cutover
+## 6.5 Animation Plan: Two Systems, One Input Stream, and a Switch You Can Undo
 
-**Scene setup:**
+**Scene:**
 
-- **Left:** a vertical input log drawn as a conveyor belt of numbered input cards (`#1041 DEPOSIT $250`, `#1042 FEE $5`...).
-- **Two horizontal lanes to the right:** top lane *Legacy core* (a grey mainframe icon), bottom lane *New ledger* (a blue cloud icon). Each lane has its own account balance card for account `CHQ-7781`.
-- **Far right:** a *Comparator* gate between the lanes, with a traffic-light indicator.
-- **Above everything:** a *Routing directory* card showing `CHQ-7781 → LEGACY, epoch 4`.
-- **Bottom strip:** a diff-rate sparkline.
+- **Left:** a conveyor belt of numbered input cards (`#1041 DEPOSIT $250`, `#1042 FEE $5`...).
+- **Two lanes on the right:** the top lane is the *Old core* (a grey mainframe icon), and the bottom lane is the *New ledger* (a blue cloud icon). Each lane shows the balance for account `CHQ-7781`.
+- **Far right:** a *Comparator* gate between the lanes, with a traffic light.
+- **Above everything:** a *Routing directory* card showing `CHQ-7781 → OLD, epoch 4`.
+- **Bottom:** a small chart of the difference rate.
 
-| Time | Beat | Visual | Manim primitives |
+| Time | Step | What you see | Manim tools |
 |---|---|---|---|
-| 0:00–0:05 | **Same inputs, same order** | Input cards leave the belt and **split**: identical copies travel down both lanes in lockstep. Both balance cards update to the same values. The comparator light is green | `TransformFromCopy`, synchronized `MoveAlongPath` |
-| 0:05–0:09 | **The dual-write counterexample** (inset) | A small inset replays the wrong design: a channel writes to both systems directly, one write fails, and a retry arrives out of order. The balances diverge by $5. Caption: *Dual-write: divergence you can't explain* | Inset `Rectangle`, red `Cross`, `Wiggle` |
-| 0:09–0:14 | **A rounding diff** | Month-end interest: the legacy card shows `accrued 1.23456 → paid 1.23`, and the new one shows `accrued 1.23457 → paid 1.23`. The comparator light turns amber, and a diff chip `accrued_interest Δ 0.00001` pops out. It is stamped **BREAK**, then routed to a triage desk icon | `Indicate`, `FadeIn(chip)`, `MoveToTarget` |
-| 0:14–0:18 | **Root cause** | The triage desk zooms in: *legacy uses half-up on daily accrual; new uses half-even*. The fix is applied to the new lane (the half-even label becomes half-up). A re-run shows the numbers match and the light is green | `Transform`, `Circumscribe` |
-| 0:18–0:22 | **A timing diff** | Input `#1090 POS $42` arrives at 23:59:58. Legacy posts it to *today*, and the new system to *tomorrow* (a business-date cut-off mismatch). The diff chip is stamped **TIMING**. The next day the chip auto-resolves and fades | Date badges, `FadeOut(chip)` after a clock advance |
-| 0:22–0:26 | **Clean streak** | The sparkline falls toward zero. A counter shows *clean business days: 1 → 23* ticking up, and a month-end marker passes with the light green | `ChangeDecimalToValue`, `ValueTracker` |
-| 0:26–0:31 | **Cutover** | The input belt pauses (*freeze*). The directory card flips to `CHQ-7781 → NEW, epoch 5`. The lanes swap emphasis: the new lane brightens as the system of record, and the legacy lane dims to *shadow*. A reverse-sync arrow appears from new to legacy | `Transform(directory)`, `set_opacity`, `GrowArrow` |
-| 0:31–0:35 | **Fencing** | A delayed write from an old channel session arrives stamped `epoch 4`. It is rejected at the directory with *stale epoch* | Red `Flash`, the arrow shatters |
-| 0:35–0:40 | **Rollback rehearsal** | A red *ROLLBACK* button is pressed. The directory flips back to `LEGACY, epoch 6`. Because reverse sync kept legacy current, both balance cards still match. Caption: *Reversible, because legacy never fell behind* | `Transform`, green light |
-| 0:40–0:44 | **Point of no return** | The reverse-sync arrow is cut. The legacy lane greys out and moves into an *Archive* box. Caption: *Declare it deliberately, never by accident* | `FadeOut`, `MoveToTarget(archive)` |
+| 0:00–0:05 | **Same inputs, same order** | Input cards leave the belt and **split**. Identical copies travel down both lanes together, both balances update to the same values, and the comparator light is green | `TransformFromCopy`, synchronized paths |
+| 0:05–0:09 | **Why not dual-write?** (side panel) | A small panel replays the wrong design: a channel writes to both systems directly, one write fails, and a retry arrives out of order. The balances end up $5 apart. Caption: *Dual-write: differences you can't explain* | Inset box, red `Cross`, `Wiggle` |
+| 0:09–0:14 | **A rounding difference** | Month-end interest: the old system shows `accrued 1.23456 → paid 1.23` and the new one `accrued 1.23457 → paid 1.23`. The light turns amber. A tag `accrued_interest Δ 0.00001` pops out, is stamped **BREAK**, and goes to an investigation desk | `Indicate`, `FadeIn`, `MoveToTarget` |
+| 0:14–0:18 | **Root cause** | The desk zooms in: *the old system rounds daily interest half-up, the new one half-even*. The new lane's rule is fixed, the re-run matches, and the light turns green | `Transform`, `Circumscribe` |
+| 0:18–0:22 | **A timing difference** | Input `#1090 POS $42` arrives at 23:59:58. The old system counts it as *today* and the new one as *tomorrow* (a cut-off mismatch). The tag is stamped **TIMING**. The next day it sorts itself out and fades away | Date badges, `FadeOut` after the clock moves |
+| 0:22–0:26 | **Clean streak** | The chart falls toward zero. A counter shows *clean business days: 1 → 23*, and a month-end marker passes with the light still green | Counting numbers |
+| 0:26–0:31 | **Switch** | The belt pauses (*freeze*). The directory card flips to `CHQ-7781 → NEW, epoch 5`. The new lane brightens (now in charge) and the old lane dims (*shadow*). A reverse-sync arrow appears from new to old | `Transform`, `set_opacity`, `GrowArrow` |
+| 0:31–0:35 | **Fencing** | A late write from an old channel session arrives stamped `epoch 4`. The directory rejects it: *old epoch* | Red `Flash`, arrow breaks |
+| 0:35–0:40 | **Rollback practice** | A red *ROLLBACK* button is pressed. The directory flips back to `OLD, epoch 6`. Because reverse sync kept the old system current, both balances still match. Caption: *You can undo it, because the old system never fell behind* | `Transform`, green light |
+| 0:40–0:44 | **Point of no return** | The reverse-sync arrow is cut. The old lane turns grey and moves into an *Archive* box. Caption: *Decide this on purpose, never by accident* | `FadeOut`, `MoveToTarget` |
 
-## 6.6 Staff-level Review Questions
+## 6.6 Review Questions
 
-- What is the single integration point that guarantees both systems see the same inputs in the same order?
-- Which external side effects could the new system emit during parallel run, and how is each one proven blocked?
-- Which periodic processes (month-end, quarter-end, year-end, rate changes, leap day) have actually been observed in parallel run, rather than assumed?
-- How are joint and linked accounts kept together across cohort boundaries?
-- What exactly must be true to roll back a cohort, and when does that stop being possible?
+- What single point guarantees that both systems see the same inputs in the same order?
+- Which real-world actions could the new system trigger during the parallel run, and how do you prove each one is blocked?
+- Which periodic jobs (month-end, quarter-end, year-end, rate changes, leap day) have you actually *seen* in the parallel run, rather than assumed?
+- How are joint and linked accounts kept together when groups move?
+- What exactly must be true to move a group back, and when does that stop being possible?
 
 ---
 

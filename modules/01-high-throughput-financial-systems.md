@@ -2,7 +2,7 @@
 
 *Industry: Banking & Fintech*
 
-## 1.1 Core Theory & Trade-offs
+## 1.1 Ideas & Trade-offs
 
 ### Event Sourcing
 
@@ -21,25 +21,25 @@ flowchart LR
 
 *[Open full-size diagram: Event sourcing - state is derived from facts (SVG)](../diagrams/m1-event-sourcing-state-is-derived-from-facts.svg)*
 
-In a CRUD system the database stores *current state*. In an event-sourced system the database stores *facts that happened*, and state is derived from them:
+**In plain words:** most apps store only the *current* value, such as "balance = 20". Event sourcing stores **every change that happened**, such as "deposited 100" and "withdrew 80", and works out the current value by adding them up.
 
 ```
 state(t) = fold(apply, events[0..t], initial_state)
 ```
 
-A ledger is the canonical case. A bank does not "update a balance". It records `FundsDebited` and `FundsCredited` postings, and the balance is the sum of those postings. Double-entry bookkeeping is event sourcing, invented about 500 years before Kafka.
+A bank ledger is the classic example. Banks don't just overwrite a balance. They record debits and credits (called **postings**), and the balance is the sum of those postings. Double-entry bookkeeping is really event sourcing, invented about 500 years before computers.
 
 | Benefit | Cost |
 |---|---|
-| Complete, tamper-evident audit trail (regulators love it) | Events are immutable forever, so **schema evolution is permanent**. You need upcasters for every historical version |
-| Temporal queries ("balance as of 2025-03-31 23:59:59 ET") | Rebuild time grows linearly. You need snapshots every N events per aggregate |
-| New read models can be built later by replaying history | The right to erasure conflicts with immutability. Use **crypto-shredding** (encrypt PII per data subject, delete the key) |
-| Debugging by replay | Every query needs a projection. "Just add a WHERE clause" goes away |
-| Natural fit for the outbox and CDC | Event design *is* public API design. Bad event granularity is expensive to undo |
+| A complete history of every change, which auditors and regulators love | Events can never be changed, so old event formats must be supported forever |
+| You can ask "what was the balance on March 31 at midnight?" | Adding up millions of events is slow, so you save **snapshots** every N events |
+| You can build new reports later by replaying history | Privacy laws may require deleting personal data. The usual fix is to encrypt each person's data with their own key, and delete the key |
+| You can debug by replaying exactly what happened | Every query needs a precomputed table (a "projection"). You can't just filter a table |
+| Works well with the outbox pattern and CDC | Choosing what an event represents is a big decision that's hard to undo |
 
-**Concurrency on streams.** Appends use optimistic concurrency: `append(stream_id, events, expected_version=v)`. If another writer appended first, the append fails and the command is retried against fresh state. This is a compare-and-swap on the stream head, and it is the core of how event stores (EventStoreDB, Marten, or a Postgres table with a `UNIQUE(stream_id, version)` constraint) avoid lost updates.
+**Stopping two writers from clashing.** When saving new events, you say what version you expect: "append these events, but only if the stream is still at version 7". If someone else added an event first, the save fails and you retry with fresh data. A simple way to build this is a table with a unique constraint on `(stream_id, version)`.
 
-**A pragmatic note.** Most production ledgers are *event-sourcing-lite*: an append-only `postings` table (the events) plus a materialized `accounts.balance` column that is updated in the same ACID transaction. The balance is a cached projection that is *transactionally consistent* with the log. You keep the audit and replay benefits without a separate event store or eventually consistent balances on the hot path.
+**What most real ledgers do.** They keep an append-only `postings` table (the events), plus an `accounts.balance` column that is updated **in the same transaction**. The balance is a cached total that always matches the postings. You get the audit trail without waiting for balances to catch up.
 
 ### CQRS (Command Query Responsibility Segregation)
 
@@ -63,17 +63,20 @@ flowchart LR
 
 *[Open full-size diagram: CQRS - separate write model and read models (SVG)](../diagrams/m1-cqrs-separate-write-model-and-read-models.svg)*
 
-CQRS separates the **write model**, which is optimized for enforcing invariants (normalized, small, strongly consistent), from one or more **read models**, which are optimized for specific queries (denormalized, possibly in different stores such as Redis, Elasticsearch or a columnar warehouse).
+**In plain words:** use one model for **changing data** (commands) and different models for **reading data** (queries).
 
-Trade-offs a Principal must be explicit about:
+- The **write model** checks the rules ("is there enough money?"). It is small, strict and always correct.
+- The **read models** are built for specific screens: a balance cache in Redis, a statement table, a search index. They are updated from events, so they may be a little behind.
 
-- **Projection lag creates read-your-writes anomalies.** A user transfers money, refreshes, and sees the old balance. Three standard fixes:
-  1. The command returns a **consistency token** (the ledger version or commit LSN). The query path waits, with a bounded timeout, until the projection's `applied_version >= token`, then falls back to the write model.
-  2. The author's immediate view reads from the write model. Everyone else reads projections.
-  3. The UI renders the optimistic result from the command response.
-- **The operational surface roughly doubles.** You now run projectors, projection rebuilds, dead-letter handling and schema versioning for each read model.
-- **Hard rule for money:** *authorization decisions read the write model, never a projection.* A projection that is 200 ms stale is fine for a statement page and dangerous for approving a withdrawal.
-- **When not to use it:** CRUD-shaped domains where reads and writes are symmetric. CQRS in a settings service is architecture tax with no return.
+Things to be careful about:
+
+- **You might not see your own change right away.** A user transfers money, refreshes, and sees the old balance. Three common fixes:
+  1. The write returns a version number, and the read waits (briefly) until the read model has reached that version, otherwise it reads the write model.
+  2. The person who made the change reads from the write model, and everyone else reads the read models.
+  3. The app shows the expected result straight from the write's response.
+- **There's more to run:** the programs that update read models, rebuilds, error handling, and versioning.
+- **Firm rule for money:** **decisions to approve a payment always read the write model, never a read model.** A read model that's 200 ms behind is fine for a statement page but dangerous for approving a withdrawal.
+- **When not to use it:** simple screens where reading and writing look the same. There, CQRS is extra work for nothing.
 
 ### ACID vs. BASE
 
@@ -100,29 +103,29 @@ flowchart LR
 
 | | ACID | BASE |
 |---|---|---|
-| Promise | Atomicity, Consistency (invariants), Isolation, Durability | Basically Available, Soft state, Eventually consistent |
-| Scaling unit | A partition or shard | The whole cluster |
-| Failure behavior | Rejects or blocks to preserve invariants | Accepts and reconciles later |
-| Ledger use | Balance mutation, posting creation | Notifications, statements, analytics, fraud features, search |
+| What it promises | All-or-nothing, rules kept, no interference, saved permanently | Available, may be temporarily out of date, catches up later |
+| Where it works | Inside one database or one shard | Across the whole system |
+| When things go wrong | Refuses or waits, to protect the rules | Accepts the work and fixes things up later |
+| Ledger use | Changing balances and saving postings | Notifications, statements, reports, fraud data, search |
 
-Real financial systems are **hybrid**. There is an ACID core *per partition* and BASE everywhere downstream. The design skill is drawing that boundary precisely.
+Real financial systems use **both**: ACID for the money-moving core, and BASE for everything that happens after. Deciding exactly where that line sits is a key design skill.
 
-**Isolation levels are where double-spends actually hide.** In PostgreSQL's default `READ COMMITTED`:
+**Where double-spending bugs really hide: isolation levels.** PostgreSQL's default is `READ COMMITTED`.
 
-- **Unsafe:** `SELECT balance ...` in the application, check `balance >= amount`, then `UPDATE accounts SET balance = :new`. Two concurrent transactions both read 100, both pass the check, and both write 20. That is a classic lost update.
-- **Safe:** `UPDATE accounts SET balance = balance - :amt WHERE id = :id AND balance >= :amt`. The row lock serializes writers, and PostgreSQL *re-evaluates the WHERE clause against the latest committed row version* after acquiring the lock. The second writer sees 20, fails the predicate, and updates zero rows.
-- **Also safe:** `SELECT ... FOR UPDATE` before checking.
-- **Write skew:** under snapshot isolation (`REPEATABLE READ` in PostgreSQL), two transactions can each read a *different* row, check a combined invariant ("joint accounts A+B must stay ≥ 0"), and both commit. Only `SERIALIZABLE` (SSI) or explicit locking of *every row in the invariant* prevents this.
+- **Unsafe:** the app reads the balance, checks `balance >= amount` in Python, then writes the new balance. Two requests both read 100, both pass the check, and both write 20. **160 was paid out of 100.** This is called a *lost update*.
+- **Safe:** `UPDATE accounts SET balance = balance - :amt WHERE id = :id AND balance >= :amt`. The row lock makes the second request wait, and PostgreSQL re-checks the WHERE condition against the latest balance. The second request sees 20, the check fails, and zero rows are updated.
+- **Also safe:** lock the row first with `SELECT ... FOR UPDATE`, then check.
+- **Write skew:** under `REPEATABLE READ`, two transactions can each read a *different* row and both break a rule that covers both rows, such as "joint accounts A + B must stay at or above 0". Only `SERIALIZABLE` isolation, or locking *every* row involved, prevents this.
 
-**Distributed transactions across services:**
+**Transactions that span several services:**
 
-| | Two-Phase Commit (2PC/XA) | Saga |
+| | Two-Phase Commit (2PC) | Saga |
 |---|---|---|
-| Atomicity | Real atomic commit | Semantic: forward steps plus compensations |
-| Isolation | Locks held across participants | None. Intermediate states are visible, so you need "pending/hold" states |
-| Failure mode | Coordinator crash leaves participants **blocked** holding locks | Compensation can fail too, so it must be idempotent and retried |
-| Latency | Two round trips plus lock hold time | Asynchronous steps |
-| Fit | A single database cluster's internal commit (Spanner, CockroachDB) | Cross-service and cross-bank money movement |
+| How | A coordinator asks everyone "ready?", then says "commit" | A chain of steps. Each step has an "undo" step (a *compensation*) |
+| All-or-nothing? | Yes | Not exactly: failed chains are undone step by step |
+| Can others see half-done work? | No, rows stay locked | Yes, so you need "pending" states |
+| If the coordinator crashes | Others wait, **stuck holding locks** | The undo steps can fail too, so they must be safe to retry |
+| Best for | Inside one database cluster | Across services and banks |
 
 ### Idempotency in Distributed Transactions
 
@@ -145,22 +148,22 @@ flowchart LR
 
 *[Open full-size diagram: Idempotency key and outbox flow (SVG)](../diagrams/m1-idempotency-key-and-outbox-flow.svg)*
 
-Delivery semantics are **at-most-once** (may lose), **at-least-once** (may duplicate) or **exactly-once**. End-to-end exactly-once *delivery* is impossible over an unreliable network. Kafka's exactly-once semantics covers read-process-write loops that stay *inside Kafka*. Once a side effect leaves Kafka (a database write, an ACH file, an email), you are back to at-least-once.
+Messages can be delivered **at most once** (may be lost), **at least once** (may be duplicated) or **exactly once**. True exactly-once delivery across a network is impossible. Kafka's "exactly-once" only covers work that stays inside Kafka. Once you write to a database, send a file or send an email, messages can arrive twice again.
 
-**Effectively-once = at-least-once delivery + an idempotent handler + a dedupe record committed in the same transaction as the side effect.**
+**So: "exactly once" in practice = at-least-once delivery + a handler that is safe to repeat + a "done" record saved in the same transaction as the change.**
 
-Idempotency-key design for a payments API:
+How to design an **idempotency key** for a payments API:
 
-- **Client-generated** UUID per *logical* operation, scoped per client (`UNIQUE(client_id, key)`).
-- **Request fingerprint** (a hash of the canonical body) stored with the key. If the same key arrives with a different payload, return `422`. This catches client bugs that would otherwise silently return the wrong cached response.
-- **Stored response** replayed byte-for-byte on retries.
-- **Retention** longer than the client's maximum retry horizon (typically 24 hours to 7 days).
-- **Deterministic business failures** (insufficient funds) should usually be *persisted and replayed* too. Otherwise a retry after a deposit could succeed, and the client's "same request" now has two different outcomes.
-- **The outbox pattern:** write the domain event into an `outbox` table *in the same transaction* as the postings. A relay (Debezium CDC reading the WAL, or a poller) publishes it. This removes the dual-write problem where the database commit succeeds but the Kafka publish fails.
+- The **client creates** a unique ID (a UUID) for each real operation and sends it in a header. The database has `UNIQUE(client_id, key)`.
+- Save a **fingerprint** (a hash) of the request body with the key. If the same key arrives with a different body, reply `422`. This catches client bugs.
+- **Save the response**, and return it again on retries.
+- **Keep keys longer** than the client's retry window: 24 hours to 7 days.
+- **Save business failures too**, such as "insufficient funds". Otherwise a retry after a deposit could succeed, and the same request would have two different outcomes.
+- **The outbox pattern:** write the event into an `outbox` table *in the same transaction* as the money change. A separate process (CDC such as Debezium, or a poller) publishes it. This avoids the classic bug where the database commit works but publishing to Kafka fails.
 
-## 1.2 Python in Practice: Idempotent Consumers, Celery/FastAPI, and Redis Locks
+## 1.2 Python: Idempotent Consumers, Celery/FastAPI, and Redis Locks
 
-### A Principal-level stance on Redlock
+### A clear position on Redis locks (Redlock)
 
 ```mermaid
 flowchart LR
@@ -178,16 +181,16 @@ flowchart LR
 
 *[Open full-size diagram: Locks for efficiency, fences for correctness (SVG)](../diagrams/m1-locks-for-efficiency-fences-for-correctness.svg)*
 
-Redlock acquires a lock with a TTL on a majority of N independent Redis masters (typically 5) and treats it as valid for `TTL - elapsed - clock_drift`. The well-known critique (Martin Kleppmann, 2016, with a rebuttal from Salvatore Sanfilippo) is:
+**Redlock** takes a lock with an expiry time on a majority of several independent Redis servers (usually 5). A well-known criticism (Martin Kleppmann, 2016, with a reply from Redis creator Salvatore Sanfilippo) points out:
 
-- **Process pauses** (GC, VM live-migration, page faults) can outlast the TTL. The holder wakes up believing it still holds a lock that has already been granted to someone else.
-- **No fencing token.** The protected resource cannot distinguish a stale holder from the current one.
-- **Timing assumptions.** Safety depends on bounded clock drift and bounded network delay.
-- A *single* Redis with async replication can lose a lock on failover.
+- **A worker can freeze** (garbage collection, a VM pause) for longer than the lock's expiry time. It wakes up thinking it still holds a lock that someone else now has.
+- **There's no fencing token**, so the database can't tell the old owner from the new one.
+- **It depends on timing**, and clocks and networks don't always behave.
+- With a *single* Redis server, a failover can lose the lock completely.
 
-**Pragmatic position:** use a Redis lock for **efficiency** (avoid thundering herds on a hot account, stop workers from piling up and hogging database connections, reduce deadlocks). Enforce **correctness** at the database with a conditional write that includes a **fencing token** or version. If the lock fails, you get extra retries, never a double-spend.
+**Practical position:** use a Redis lock to make things **faster** (fewer workers fighting over the same account, fewer deadlocks). Use the **database** to keep things **correct**, with a conditional write that includes a **fencing token** or version number. If the lock fails, you get some extra retries, never a double-spend.
 
-### FastAPI: an idempotent transfer endpoint
+### FastAPI: a money-transfer endpoint that's safe to retry
 
 ```python
 from __future__ import annotations
@@ -282,13 +285,13 @@ async def create_transfer(
         return response
 ```
 
-Design notes:
+Why it's built this way:
 
-- The key claim, invariant check, postings, outbox and stored response all commit **atomically**. There is no window in which money moved but the key is unrecorded.
-- Because everything is in one transaction, an explicit `in_progress` state is unnecessary. You need one when the operation spans *external* calls (for example, a card network authorization). In that case you persist `in_progress`, return `409 Retry-After` to duplicates, and run a recovery sweeper for stuck keys.
-- Add a `CHECK (balance >= 0)` constraint on accounts that cannot go negative. It is a last line of defense that costs nothing.
+- Claiming the key, checking the rules, saving the postings, writing the outbox and saving the response all happen in **one transaction**. There's no moment where money moved but the key wasn't saved.
+- Because it's all one transaction, you don't need an "in progress" state. You *do* need one if the operation calls something outside the database (like a card network). In that case, save "in progress", reply `409 Retry-After` to duplicates, and run a sweeper for stuck keys.
+- Add a `CHECK (balance >= 0)` constraint to accounts that can't go negative. It's a free last line of defence.
 
-### Celery: an idempotent consumer with a fenced lock
+### Celery: a consumer that's safe to repeat, with a fenced lock
 
 ```python
 import secrets
@@ -372,9 +375,9 @@ def apply_debit(self, msg_id: str, account_id: str, amount_minor: int) -> str:
 
 **Honest caveats:**
 
-- A Redis `INCR` counter can itself go backwards after an async-replica failover. The strongest variant draws the fence from the database (a sequence, or the row's own `version`), which reduces the scheme to plain optimistic concurrency. The Redis lock then remains purely a contention reducer.
-- If every write already goes through `UPDATE ... WHERE balance >= :a` inside a transaction, *correctness does not need the Redis lock at all*. You add it when hot-row contention exhausts connection pools, or when the critical section includes non-database work you want to serialize.
-- Money uses **integer minor units** or `Decimal`. Never `float`.
+- A Redis counter can go *backwards* if Redis fails over to a replica that was behind. The strongest option takes the fence number from the database (a sequence, or the row's own `version`), which is just optimistic locking. The Redis lock then only reduces contention.
+- If every write already uses `UPDATE ... WHERE balance >= :a` inside a transaction, you *don't need* the Redis lock for correctness. Add it only when busy rows exhaust your connection pool, or when the protected work includes steps outside the database.
+- Store money as **whole cents (integers)** or `Decimal`. **Never use `float`.**
 
 ## 1.3 Case Study: A 10,000 TPS Ledger with Zero Double-Spend
 
@@ -396,46 +399,58 @@ flowchart LR
 
 *[Open full-size diagram: Sharded ledger with cross-shard saga (SVG)](../diagrams/m1-sharded-ledger-with-cross-shard-saga.svg)*
 
-**Requirements:** 10k TPS sustained, 30k TPS peak (payroll days, Black Friday). p99 authorization latency under 150 ms. RPO = 0 within a region and RTO under 60 s. Zero double-spend. Seven-year audit retention with immutability.
+**Requirements:** 10,000 transactions per second normally, and 30,000 at peak (payday, Black Friday). 99% of payment approvals within 150 ms. No data loss in a region, and recovery within 60 seconds. **No double-spending, ever.** Seven years of records that can't be altered.
 
-### Capacity math
+### Rough numbers
 
-| Quantity | Estimate |
+| What | Estimate |
 |---|---|
-| Postings per second | 10k tx/s × 2 postings = 20k rows/s (60k at peak) |
-| Hot-path write volume | ~500 B per posting including index overhead → ~10 MB/s |
-| Daily growth | 864M transactions/day → roughly 0.8–1 TB/day of postings and events |
-| Seven-year retention | Petabyte scale, so tier it: 90 days hot in OLTP, older data as Parquet in ADLS Gen2 (S3/GCS) with WORM immutability policies |
-| Single-primary ceiling | A well-tuned PostgreSQL primary with synchronous standby and group commit can sustain thousands to low tens of thousands of short write transactions per second. At 30k peak with two-row locks per transaction, there is **no headroom**, and hot rows cap you well below hardware limits |
+| Postings per second | 10,000 × 2 = 20,000 rows/s (60,000 at peak) |
+| Data written | ~500 bytes per posting, including indexes → ~10 MB/s |
+| Growth per day | 864 million transactions/day → about 1 TB/day |
+| Seven years | Petabytes. So keep 90 days in the main database and move older data to cheap storage (Parquet files in ADLS Gen2, S3 or GCS) with "can't delete" (WORM) rules |
+| One database server's limit | A well-tuned PostgreSQL primary with a synchronous standby can handle thousands to low tens of thousands of short write transactions per second. At 30,000 per second, each locking two rows, there is **no spare room**, and busy rows slow things further |
 
-**Conclusion:** partition the write path by account.
+**Conclusion:** split the ledger across several databases, by account.
 
-### Architecture decisions
+### Design decisions
 
-**Partitioning.** Hash account IDs into N ledger shards (start with 32 logical shards mapped onto fewer physical servers, so you can split later without rehashing). An intra-shard transfer is one local ACID transaction. A cross-shard transfer becomes a **saga**: debit the source into a per-shard *suspense* (in-flight) account, then credit the destination. Both steps are idempotent by `transfer_id`, and a reconciler asserts that every suspense account nets to zero.
+**Splitting (sharding).** Hash account IDs into shards. Start with 32 logical shards on fewer servers, so you can split later without rehashing everything. A transfer inside one shard is a normal transaction. A transfer **between** shards becomes a **saga**:
 
-**Three ways to serialize writes per account:**
+1. Move money from the source account into a "money in transit" (**suspense**) account on its shard.
+2. Credit the destination.
 
-| Option | How | Pros | Cons |
+Both steps are safe to repeat thanks to the transfer ID. A reconciliation job checks that every suspense account nets to zero.
+
+**Three ways to make sure one account's writes happen one at a time:**
+
+| Option | How | Good | Bad |
 |---|---|---|---|
-| **A. Row locks per shard** (the code above) | `FOR UPDATE` / conditional `UPDATE` in PostgreSQL | Familiar, strongly consistent, easy to audit | Hot-row contention. Deadlock discipline needed |
-| **B. Single writer per partition** (LMAX / actor style) | Commands keyed by `account_id` into Kafka/Event Hubs partitions. One consumer per partition keeps balances in memory and writes in batches | No locks, very high throughput, deterministic ordering | Rebalancing pauses. The in-memory state must be rebuilt from a snapshot plus log. Harder to operate |
-| **C. Distributed SQL** | Spanner, CockroachDB, YugabyteDB (Raft per range) | Global serializability, automatic resharding | Cross-range transactions pay consensus RTT. Vendor coupling. Cost |
+| **A. Row locks** (the code above) | `FOR UPDATE` or a conditional `UPDATE` in PostgreSQL | Familiar, strictly correct, easy to audit | Busy accounts queue up. Must lock in a fixed order to avoid deadlocks |
+| **B. One worker per partition** | Send commands keyed by account into Kafka/Event Hubs partitions. One worker per partition keeps balances in memory and saves in batches | No locks, very fast, strict order | Pauses when partitions move. The in-memory state must be rebuilt after restarts |
+| **C. Distributed SQL database** | Spanner, CockroachDB, YugabyteDB | Handles splitting for you | Transactions across regions are slower. Vendor lock-in. Cost |
 
-Most regulated banks choose **A**, moving to **B** for the highest-volume flows. Purpose-built ledgers (for example TigerBeetle) take B to its extreme.
+Most banks choose **A**, and use **B** for their busiest flows. Purpose-built ledger databases such as TigerBeetle take option B to the extreme.
 
-**Hot accounts.** A marketplace settlement account may receive 2,000 credits/s. Row locks serialize them at maybe 1–3k/s, and every other transfer touching that row queues behind them. Two fixes:
+**Very busy accounts.** A marketplace account might receive 2,000 payments per second. Row locks handle maybe 1,000–3,000 per second on one row, and everything else touching it waits. Two fixes:
 
-- **Credits are commutative.** Append credit postings without locking the balance, then fold them into the balance in micro-batches. Only *debits* need the invariant check.
-- **Split the balance across K sub-accounts** (`merchant-123#0..#15`). Credits pick a sub-account at random. Reads sum them. Debits either use a sub-account with sufficient funds or run a sweep.
+- **Adding money can happen in any order.** Save the credits without locking the balance, and add them to the balance in small batches. Only *withdrawals* need the "enough money?" check.
+- **Split the balance across K sub-accounts** (`merchant-123#0` to `#15`). Each credit picks one at random, and reads add them up.
 
-**Read side (CQRS).** Projections feed a Redis balance cache (for display only, labeled "as of"), statement tables in a read replica, search in Elasticsearch/Azure AI Search, and analytics in a lakehouse. **Authorization never reads a projection.**
+**Reads (CQRS):** a Redis balance cache (display only, labelled "as of"), statement tables on a replica, search, and reports in a data lake. **Payment approvals never read these.**
 
-**Continuous reconciliation invariants:** postings per `tx_id` sum to zero per currency. The daily trial balance nets to zero. The sum of postings per account equals the account's materialized balance. Projection checksums match the write model. Any break pages the on-call engineer. This is cheaper than any lock and catches the bugs locks cannot.
+**Automatic checks that run all the time:**
 
-**Azure mapping:** Azure Database for PostgreSQL Flexible Server with zone-redundant HA (synchronous standby, RPO 0 in-region) per shard, or Citus-based sharding. Event Hubs with the Kafka endpoint for the event bus. Azure Cache for Redis for locks and caches. ADLS Gen2 with immutability policies for the archive. Key Vault with HSM-backed keys for crypto-shredding.
+- Every transaction's postings add up to zero.
+- The daily trial balance nets to zero.
+- Each account's postings add up to its balance.
+- Read models match the write model.
 
-## 1.4 Mermaid: Command and Query Paths
+Any mismatch alerts the on-call engineer. These checks are cheaper than any lock, and they catch bugs that locks can't.
+
+**Azure services:** Azure Database for PostgreSQL Flexible Server with zone-redundant HA, per shard (or Citus for sharding). Event Hubs (Kafka API) for events. Azure Cache for Redis. ADLS Gen2 with immutability policies for the archive. Key Vault for encryption keys.
+
+## 1.4 Diagram: Command and Query Paths
 
 ```mermaid
 sequenceDiagram
@@ -496,36 +511,36 @@ sequenceDiagram
 
 *[Open full-size diagram: Command and query paths (SVG)](../diagrams/m1-command-and-query-paths.svg)*
 
-## 1.5 Animation Blueprint: A Double-Spend Race Blocked by a Fenced Lock
+## 1.5 Animation Plan: A Double-Spend Race Blocked by a Fenced Lock
 
-**Scene setup (Manim Community, 1920×1080, 60 fps, dark background):**
+**Scene (Manim, 1920×1080, 60 fps, dark background):**
 
-- **Centre-bottom:** a green `RoundedRectangle` labelled *Ledger DB* containing `balance = 100 | last_fence = 32`.
-- **Top-centre:** a grey padlock-shaped group labelled *Redis lock: free*, with a circular TTL arc beside it.
-- **Left:** worker **W1** (blue circle). **Right:** worker **W2** (orange circle). Each has a speech bubble showing the intent `withdraw 80`.
-- A caption bar along the bottom third shows narration.
+- **Bottom centre:** a green box *Ledger DB* showing `balance = 100 | last_fence = 32`.
+- **Top centre:** a grey padlock labelled *Redis lock: free*, with a timer ring beside it.
+- **Left:** worker **W1** (blue circle). **Right:** worker **W2** (orange circle). Each has a speech bubble saying `withdraw 80`.
+- A caption bar at the bottom for narration.
 
-The animation has three acts, which move from the naive race, to the textbook lock, to the pathology that makes fencing necessary.
+There are three acts: the race with no lock, the race with a lock, and the case where the lock alone isn't enough.
 
-| Time | Act | Visual | Manim primitives |
+| Time | Act | What you see | Manim tools |
 |---|---|---|---|
-| 0:00–0:03 | **I. No lock** | Title card: "Two withdrawals, one balance" | `Write`, `FadeOut` |
-| 0:03–0:07 | I | W1 and W2 both fire a `READ` arrow at the DB at the same moment. Both bubbles show `saw 100` | `GrowArrow` ×2 in `AnimationGroup` |
-| 0:07–0:10 | I | Both compute `100 − 80 = 20` (small calculator glyph above each) | `TransformMatchingTex` |
-| 0:10–0:14 | I | Both `WRITE 20` arrows hit the DB. The balance shows 20. A counter "withdrawn: 160" appears in red | `Transform`, `Flash(color=RED)` |
-| 0:14–0:17 | I | Caption: **"Lost update: 160 paid out of 100."** The screen desaturates and rewinds | `Wiggle`, reverse `ValueTracker` |
-| 0:17–0:21 | **II. Lock** | W1 sends `SET NX PX` to Redis. The lock turns blue, labelled `W1 · token 33`. The TTL arc starts full | `Indicate`, `always_redraw(Arc)` |
-| 0:21–0:24 | II | W2's acquire arrow bounces off the padlock with a small "busy" spark, then arcs back along a dashed path labelled `backoff + jitter` | `MoveAlongPath` on `ArcBetweenPoints`, `Flash` |
-| 0:24–0:28 | II | W1 performs the conditional write. The DB shows `balance = 20 | last_fence = 33`. The lock releases and returns to grey | `Transform`, `set_color` |
-| 0:28–0:33 | II | W2 retries, acquires `token 34`, reads 20, and its bubble shows `20 < 80 → REJECT: insufficient funds` | `Write`, `Circumscribe` |
-| 0:33–0:36 | II | Caption: **"The lock serialised the race. But it only works if the holder is alive and on time…"** | — |
-| 0:36–0:40 | **III. Pause** | Reset to 100 / fence 32. W1 acquires `token 33`, then freezes: it turns grey with an ice-crystal overlay and a label `GC pause 4.2 s` | `set_fill(opacity=0.4)`, `FadeIn` |
-| 0:40–0:44 | III | The TTL arc drains linearly to zero. The padlock pops open: *lock expired* | `ttl.animate.set_value(0)`, `rate_func=linear` |
-| 0:44–0:48 | III | W2 acquires `token 34` and writes. The DB shows `balance = 20 | last_fence = 34` | `Transform` |
-| 0:48–0:53 | III | W1 thaws and, still believing it holds the lock, fires `WRITE ... fence=33`. The arrow hits a shield that rises out of the DB: **`WHERE last_fence < 33` → 0 rows**. The arrow shatters | `GrowFromCenter(shield)`, `ShowPassingFlash`, `FadeOut(arrow, shift=DOWN)` |
-| 0:53–0:58 | III | Side-by-side recap panel: *Lock = efficiency* on the left, *Fence + conditional write = correctness* on the right | `VGroup.arrange(RIGHT)` |
+| 0:00–0:03 | **I. No lock** | Title: "Two withdrawals, one balance" | `Write`, `FadeOut` |
+| 0:03–0:07 | I | W1 and W2 both send a `READ` arrow to the database at the same time. Both bubbles say `saw 100` | Two `GrowArrow`s together |
+| 0:07–0:10 | I | Both work out `100 − 80 = 20` | `TransformMatchingTex` |
+| 0:10–0:14 | I | Both `WRITE 20`. The balance shows 20, and a red counter shows "paid out: 160" | `Transform`, red `Flash` |
+| 0:14–0:17 | I | Caption: **"Lost update: 160 paid out of 100."** The screen fades and rewinds | `Wiggle`, rewind |
+| 0:17–0:21 | **II. With a lock** | W1 takes the lock. It turns blue and shows `W1 · token 33`, and the timer ring starts | `Indicate`, timer arc |
+| 0:21–0:24 | II | W2 tries to take the lock, bounces off with a "busy" spark, and curves back along a dashed path labelled `wait and retry` | `MoveAlongPath`, `Flash` |
+| 0:24–0:28 | II | W1 writes. The database shows `balance = 20 | last_fence = 33`. The lock is released and turns grey | `Transform` |
+| 0:28–0:33 | II | W2 retries, gets `token 34`, reads 20, and its bubble says `20 < 80 → REJECT: not enough money` | `Write`, `Circumscribe` |
+| 0:33–0:36 | II | Caption: **"The lock made them take turns. But only if the lock holder is alive and on time…"** | — |
+| 0:36–0:40 | **III. Freeze** | Reset to 100 / fence 32. W1 takes `token 33`, then freezes: it turns grey with ice, labelled `paused 4.2 s` | Fade, `FadeIn` |
+| 0:40–0:44 | III | The timer ring runs out. The lock opens: *lock expired* | Timer to zero |
+| 0:44–0:48 | III | W2 takes `token 34` and writes. The database shows `balance = 20 | last_fence = 34` | `Transform` |
+| 0:48–0:53 | III | W1 unfreezes, still thinks it has the lock, and sends `WRITE ... fence=33`. A shield rises from the database: **`only if last_fence < 33` → 0 rows**. The arrow breaks | Shield, `ShowPassingFlash`, arrow falls |
+| 0:53–0:58 | III | Summary panel: *Lock = speed* on the left, *Fence + conditional write = correctness* on the right | `VGroup.arrange` |
 
-**Manim skeleton for Act III:**
+**Manim code for Act III:**
 
 ```python
 from manim import *
@@ -573,13 +588,13 @@ class FencedLockRace(Scene):
         self.wait()
 ```
 
-## 1.6 Staff-level Review Questions
+## 1.6 Review Questions
 
-- Where exactly is the ACID boundary, and what is the *business* consequence of every piece of state outside it being stale for 5 seconds?
-- What happens to an idempotency key when the operation fails deterministically, and does the client get the same answer on retry?
-- If the Redis cluster is entirely unavailable, does the ledger stop, slow down, or lose correctness? (The right answer is "slow down".)
-- How long does replaying the largest account's stream take, and what is the snapshot policy?
-- Which reconciliation invariant would have detected your last production incident?
+- Exactly which data is protected by transactions, and what would happen to the business if everything else were 5 seconds out of date?
+- When an operation fails for a business reason, is the failure saved, and does a retry get the same answer?
+- If Redis is completely down, does the ledger stop, slow down, or become wrong? (The right answer is "slow down".)
+- How long does it take to replay the biggest account's history, and how often are snapshots taken?
+- Which automatic check would have caught your last production incident?
 
 ---
 

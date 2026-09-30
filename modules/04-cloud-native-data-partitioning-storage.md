@@ -2,7 +2,7 @@
 
 *Cross-industry*
 
-## 4.1 Core Theory & Trade-offs
+## 4.1 Ideas & Trade-offs
 
 ### Sharding strategies
 
@@ -20,25 +20,27 @@ flowchart LR
 
 *[Open full-size diagram: Three ways to route a key to a shard (SVG)](../diagrams/m4-three-ways-to-route-a-key-to-a-shard.svg)*
 
-| Strategy | How | Strengths | Weaknesses |
+**In plain words:** when data is too big or too busy for one database, you split it into **shards**. Each shard holds part of the data on its own machine. The big question is how to decide which shard each row belongs to.
+
+| Strategy | How | Good | Bad |
 |---|---|---|---|
-| **Range** | Contiguous key ranges per shard (Bigtable, HBase, CockroachDB, Spanner) | Efficient range scans. Ranges can be split and merged dynamically | Monotonic keys (timestamps, auto-increment IDs) create a single hot shard |
-| **Hash** | `shard = hash(key) mod N` | Even distribution | No range scans. **Changing N remaps nearly every key** |
-| **Consistent hash** | Keys and nodes on a hash ring | Adding or removing a node moves only ~1/N of keys | Placement is emergent, so it can't express policy |
-| **Directory / lookup** | An explicit `key → shard` table | Arbitrary placement: residency, noisy-neighbour isolation, one-tenant moves | Lookup is on the critical path (so cache it). The directory must be highly available |
-| **Geo / entity** | By region or tenant | Aligns with legal and organizational boundaries | Uneven sizes |
-| **Composite** | Directory to a cell, hash within the cell | Policy at the top, uniformity underneath | Two layers to operate |
+| **Range** | Each shard holds a range of keys (A–F, G–M…) | Fast range scans. Ranges can be split as they grow | Keys that always increase (timestamps, auto-increment IDs) all land on the last shard |
+| **Hash** | `shard = hash(key) mod N` | Spreads data evenly | No range scans. **Changing N moves almost every key** |
+| **Consistent hash** | Keys and servers placed on a ring | Adding or removing a server moves only about 1/N of keys | You can't choose where a specific key goes |
+| **Directory (lookup table)** | A table says which shard each key is on | Full control: keep data in the right country, move one busy customer | The lookup happens on every request (cache it). The table must always be available |
+| **By region or customer** | Split by country or tenant | Matches legal and business boundaries | Shards can be very different sizes |
+| **Mixed** | A directory picks the group, a hash picks the shard inside it | Rules at the top, even spread underneath | Two layers to manage |
 
-**Shard-key criteria**, in priority order:
+**How to choose a shard key**, most important first:
 
-1. It keeps the **dominant queries single-shard**.
-2. It spreads *load*, not just data. A tenant with 1% of rows can generate 30% of queries.
-3. It is high-cardinality and **immutable**. Changing a row's shard key is a cross-shard move.
-4. It aligns with **isolation boundaries** such as tenant or jurisdiction.
+1. The **most common queries** should need only **one shard**.
+2. It should spread the *load*, not just the data. A customer with 1% of the rows can make 30% of the queries.
+3. It should have many distinct values and **never change**. Changing a row's shard key means moving it to another shard.
+4. It should match **isolation boundaries**, such as customer or country.
 
-**The hidden cost is tail latency.** A scatter-gather query waits for its slowest shard. If each shard independently meets a 10 ms p99, then fanning out to 50 shards gives `P(all under p99) = 0.99⁵⁰ ≈ 0.61`. About **39% of queries** will see at least one p99-slow shard. Fan-out queries need hedged requests, partial results, or a separate read model built for the purpose.
+**The hidden cost: slow queries that touch every shard.** A query that asks all shards must wait for the slowest one. If each shard is fast 99% of the time, a query touching 50 shards is fast on all of them only `0.99⁵⁰ ≈ 61%` of the time, so **about 39% of these queries** hit at least one slow shard. Queries that fan out need tricks: sending a backup request, returning partial results, or a separate read model built for that query.
 
-Also budget for: cross-shard transactions (sagas, or 2PC inside a distributed SQL engine), global secondary indexes, global uniqueness constraints (email addresses across shards), and resharding.
+Also plan for: transactions across shards (sagas, or a distributed SQL database), indexes that cover all shards, uniqueness across shards (for example, unique email addresses), and moving data between shards.
 
 ### Consistent hashing
 
@@ -54,22 +56,22 @@ flowchart LR
 
 *[Open full-size diagram: Consistent hashing lookup with virtual nodes and replicas (SVG)](../diagrams/m4-consistent-hashing-lookup-with-virtual-nodes-and-replicas.svg)*
 
-Place nodes and keys on a ring `[0, 2³²)` using a hash. Each key belongs to the first node **clockwise** from it. Adding a node takes over only the arc between it and its predecessor, so about `K/N` keys move instead of nearly all of them.
+**In plain words:** imagine a clock face. Servers and keys are both placed on it using a hash. Each key belongs to the next server **clockwise**. When a server is added, it takes over only the keys between itself and the server before it, about `K/N` keys, not nearly all of them.
 
-- **Virtual nodes** (100–256 tokens per physical node) smooth out an uneven ring. They allow **capacity weighting**: a bigger node gets more tokens. When a node fails, its load spreads across many survivors instead of landing entirely on its single clockwise neighbour.
-- **Replication:** store each key on the next R *distinct physical* nodes clockwise. This is the Dynamo "preference list".
+- **Virtual nodes:** each real server appears at 100–256 spots on the ring. This evens out the spread, lets bigger servers take more spots, and when a server dies its load spreads over many servers instead of landing on its one neighbour.
+- **Copies:** store each key on the next R *different real servers* clockwise. This is how Amazon's Dynamo did it.
 
-**Alternatives worth knowing:**
+**Other options worth knowing:**
 
-| Scheme | Lookup | Properties | Fit |
+| Method | Lookup cost | Properties | Best for |
 |---|---|---|---|
-| Ring + vnodes | O(log V) | Flexible membership, needs a token table | Dynamo-style stores, cache clusters |
-| **Rendezvous (HRW)** | O(N): `argmax hash(key, node)` | No ring, minimal disruption, trivial weighting | Tens to hundreds of nodes, CDN and cache selection |
-| **Jump consistent hash** | O(ln N), no memory | Perfectly even, but buckets can only be added or removed *at the end* | Numbered shards, not arbitrary nodes |
-| Bounded-load consistent hashing | O(log V) | Caps any node at (1+ε) × average load | Hot-key-prone caches and load balancers |
-| Maglev | O(1) table lookup | Fast, near-even, minimal disruption | L4 load balancers |
+| Ring + virtual nodes | Fast (a binary search) | Flexible membership. Needs a token table | Dynamo-style databases, cache clusters |
+| **Rendezvous (HRW)** | Checks every server: pick the highest `hash(key, server)` | No ring, little movement, easy weighting | Tens to hundreds of servers, CDNs, caches |
+| **Jump hash** | Very fast, no memory | Perfectly even, but you can only add or remove servers *at the end* | Numbered shards |
+| Bounded-load hashing | Fast | Caps each server at slightly above average load | Caches with hot keys, load balancers |
+| Maglev | A single table lookup | Fast, nearly even, little movement | Network load balancers |
 
-**When not to use consistent hashing:** when placement is **policy**. Data residency, "this tenant gets a dedicated database" and "move this noisy tenant off shard 7" are directory decisions. A hash function cannot express law.
+**When *not* to use consistent hashing:** when placement is a **rule**. "This customer's data must stay in Canada", "this customer gets its own database" and "move this noisy customer off shard 7" are lookup-table decisions. A hash function can't follow the law.
 
 ### Write-Ahead Logging (WAL)
 
@@ -90,26 +92,28 @@ flowchart LR
 
 *[Open full-size diagram: WAL durability and recovery (SVG)](../diagrams/m4-wal-durability-and-recovery.svg)*
 
-**The WAL rule:** a log record describing a change must reach durable storage *before* the modified data page does, and *before* the commit is acknowledged.
+**In plain words:** before a database changes its main data, it first writes a note in a log file saying what it's about to change. If it crashes, it reads the log to finish or redo the changes. That's why a committed transaction survives a power cut.
 
-- Changes are applied to pages in the **buffer pool**, which makes them *dirty*. Dirty pages are flushed lazily by the background writer and by **checkpoints**.
-- A **checkpoint** records a *redo point*: all changes before it are safely in the data files.
-- **Crash recovery** replays WAL from the last redo point. For each record, the page is modified only if the on-disk page's **pageLSN is lower than the record's LSN**. This makes redo *idempotent* — the same idea as Module 1, at the storage-engine level.
-- ARIES-style engines (SQL Server, InnoDB) also run **undo** for uncommitted transactions. PostgreSQL is effectively **redo-only**: thanks to MVCC, an uncommitted transaction's tuples simply stay invisible because the commit log never marks it committed.
+**The WAL rule:** the log entry must be safely on disk *before* the changed data page is written, and *before* the database tells the client "committed".
 
-**Why WAL is fast:** it turns random page writes into **sequential appends**. **Group commit** amortizes one `fsync` across many concurrent transactions.
+- Changes are first made to data pages in memory (the **buffer pool**), which marks those pages *dirty*. Dirty pages are written to disk later, in the background and during **checkpoints**.
+- A **checkpoint** records a safe point: everything before it is in the data files.
+- **Crash recovery** replays the log from the last checkpoint. A page is changed only if its stored log number (pageLSN) is **lower** than the log entry's number. So replaying twice is harmless: recovery is *idempotent*, the same idea as in Module 1.
+- Some databases (SQL Server, MySQL InnoDB) also **undo** unfinished transactions. PostgreSQL doesn't need to: unfinished transactions are simply never marked as committed, so their rows stay invisible (thanks to MVCC).
 
-**Knobs and their trade-offs (PostgreSQL):**
+**Why it's fast:** adding to the end of a log file is much faster than writing pages all over the disk. **Group commit** saves many transactions with one disk sync.
+
+**PostgreSQL settings and their trade-offs:**
 
 | Setting | Effect | Risk |
 |---|---|---|
-| `synchronous_commit = off` | Acknowledges before the WAL flush, giving much higher throughput | Loses the last few hundred ms of acknowledged transactions on crash. **No corruption**, but RPO > 0 |
-| `full_page_writes = on` | Writes a full page image on the first change after a checkpoint | Protects against torn pages. Increases WAL volume |
-| Frequent checkpoints | Fast recovery | More I/O and more full-page images |
-| Infrequent checkpoints | Less I/O | Longer crash recovery (the RTO grows) |
-| `synchronous_standby_names = 'ANY 1 (s1, s2)'` | Quorum synchronous replication | Commit latency includes the standby's flush, but one standby can fail without blocking commits |
+| `synchronous_commit = off` | Replies "committed" before the log is on disk. Much faster | A crash loses the last few hundred ms of "committed" transactions. **No corruption**, but some data loss |
+| `full_page_writes = on` | Writes a full page copy the first time a page changes after a checkpoint | Protects against half-written pages. Bigger log |
+| Frequent checkpoints | Faster recovery | More disk work |
+| Rare checkpoints | Less disk work | Slower recovery after a crash |
+| `synchronous_standby_names = 'ANY 1 (s1, s2)'` | Waits for one of two standbys to confirm | Commits wait for a standby, but one standby can fail without blocking |
 
-**WAL is also the replication stream.** Physical streaming replication ships WAL to standbys. **Logical decoding** turns it into change events for CDC (Debezium), which is exactly the outbox relay from Module 1. The pattern generalizes: in Kafka, "the log *is* the database", and tables are its cached projections. LSM-tree engines (RocksDB, Cassandra) follow the same order: WAL, then memtable, then immutable SSTables, then compaction.
+**The WAL is also how replicas stay updated.** Streaming replication sends the WAL to standby servers. **Logical decoding** turns it into change events for CDC tools (Debezium). That's exactly the outbox relay from Module 1. The general idea: "the log *is* the database", and tables are just a cached result of it. Write-optimized databases (RocksDB, Cassandra) follow the same order: log first, then memory, then files on disk.
 
 ### Read replicas vs. multi-primary replication
 
@@ -138,21 +142,21 @@ flowchart LR
 
 *[Open full-size diagram: Single primary vs multi-primary replication (SVG)](../diagrams/m4-single-primary-vs-multi-primary-replication.svg)*
 
-| Model | Writes | Reads | Conflicts | Failure behaviour |
+| Model | Writes | Reads | Conflicts | When things fail |
 |---|---|---|---|---|
-| Single primary + **async** replicas | One node | Scale out, but stale | None | Failover can lose acknowledged writes (RPO > 0) |
-| Single primary + **sync/quorum** replicas | One node + standby ack | Scale out | None | RPO 0. Commit latency includes a standby round trip |
-| **Multi-primary** (e.g. bidirectional logical replication, Cosmos DB multi-region writes) | Many nodes or regions | Local | **Inevitable** under concurrency: LWW, merge functions, CRDTs | Writes stay available during a partition, and state diverges |
-| **Consensus-replicated** (Spanner, CockroachDB) | Per-range Raft leader | Leader, or follower reads with bounded staleness | Prevented by consensus | Needs a majority. Pays cross-region RTT |
+| One primary + **async** replicas | One server | Many servers, slightly behind | None | Failover can lose recently confirmed writes |
+| One primary + **sync** replicas | One server + a standby confirmation | Many servers | None | No data loss. Each commit waits for the standby |
+| **Multi-primary** (several servers or regions accept writes) | Many | Local | **Will happen**. Need a rule: newest wins, merge, or CRDTs | Keeps accepting writes during a split, and data drifts apart |
+| **Consensus-based** (Spanner, CockroachDB) | One leader per data range | Leader, or followers with a known delay | Prevented | Needs a majority. Slower across regions |
 
-**Replica read anomalies and fixes:**
+**Common replica problems and fixes:**
 
-- **Read-your-writes:** return the commit LSN from the write. Read from a replica only if `pg_last_wal_replay_lsn() >= lsn`, otherwise use the primary.
-- **Monotonic reads:** pin a session to one replica, or carry the highest LSN seen so far.
+- **Not seeing your own write:** after writing, remember the database log position. Read from a replica only if it has caught up to that position (`pg_last_wal_replay_lsn()`), otherwise read from the primary.
+- **Going back in time:** keep a user on one replica, or remember the newest position they've seen.
 
-**Principal heuristic:** *multi-primary is a conflict-resolution strategy wearing an availability costume.* Last-writer-wins silently discards data and depends on clocks. Prefer **single writer per partition** (each tenant or row has a home) with fast failover. Reserve multi-primary for data with natural merge semantics: counters, sets, presence, carts.
+**Rule of thumb:** *multi-primary sounds like "always available", but it's really a conflict-resolution problem.* "Newest write wins" quietly throws away data and depends on clocks. Prefer **one writer per piece of data** (each customer or row has a home), with fast failover. Use multi-primary only for data that merges naturally: counters, sets, online status, shopping carts.
 
-## 4.2 Python in Practice: Tenant-Aware Routing in SQLAlchemy (and Django)
+## 4.2 Python: Routing Each Customer to the Right Database in SQLAlchemy (and Django)
 
 ```mermaid
 flowchart LR
@@ -172,13 +176,13 @@ flowchart LR
 
 *[Open full-size diagram: Tenant-aware request routing (SVG)](../diagrams/m4-tenant-aware-request-routing.svg)*
 
-The routing design has five parts:
+How the routing works:
 
-1. **Resolve placement once per request**, asynchronously, from a cached tenant directory.
-2. **Pin placement to the session.** Don't re-read ambient state inside `get_bind`, where a background task could change it mid-session.
-3. **Refuse cross-region access** at the application layer.
-4. **Enforce isolation in the database** with row-level security as defense in depth.
-5. **Split reads and writes** where replicas exist.
+1. **Look up where the customer's data lives, once per request**, from a cached tenant directory.
+2. **Save that location on the session**, so a background task can't accidentally change it halfway through.
+3. **Refuse to read another region's data** in the application.
+4. **Let the database enforce isolation too**, with row-level security, as a second safety net.
+5. **Send reads and writes to different servers** where replicas exist.
 
 ```python
 from __future__ import annotations
@@ -274,7 +278,7 @@ async def tenant_session(
         yield session
 ```
 
-Database-side isolation, in case the application layer ever gets it wrong:
+Database-side safety net, in case the app ever gets it wrong:
 
 ```sql
 ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
@@ -285,11 +289,11 @@ CREATE POLICY tenant_isolation ON invoices
 -- The application role must NOT be a superuser and must NOT have BYPASSRLS.
 ```
 
-Trade-offs to state out loud:
+Trade-offs to say out loud:
 
-- For a single-tenant, request-scoped session, binding the `AsyncSession` directly to the right engine is simpler than overriding `get_bind`. The override earns its place when one session spans **several binds**: reference data versus tenant data, or reads versus writes.
-- Read/write splitting by HTTP method is coarse. A `GET` immediately after a `POST` can read a lagging replica. Carry the commit LSN in a cookie or header and fall back to the primary when the replica is behind.
-- **Django equivalent:** a database router with `db_for_read` and `db_for_write` that reads the tenant from a `contextvars.ContextVar` set by middleware, plus `DATABASES` entries registered per shard at startup. The same rules apply to RLS and wrong-region checks.
+- For a simple one-customer-per-request session, binding the session directly to the right engine is simpler than overriding `get_bind`. The override is worth it when one session uses **several databases**: shared reference data plus customer data, or reads plus writes.
+- Choosing replica vs. primary by HTTP method is rough. A `GET` right after a `POST` may read a replica that's behind. Send the commit position in a cookie or header, and use the primary if the replica hasn't caught up.
+- **In Django:** a database router with `db_for_read` and `db_for_write` that reads the current customer from a `contextvars.ContextVar` set by middleware, plus one `DATABASES` entry per shard. The same row-level security and region checks apply.
 
 ## 4.3 Case Study: A Multi-Tenant B2B SaaS Platform with Data Residency
 
@@ -312,54 +316,54 @@ flowchart TB
 
 **Requirements:**
 
-- About 4,000 tenants, ranging from 20-seat SMBs to 50,000-seat enterprises (**a 1,000× size spread**).
-- EU tenants' data stays in the EU. Canadian public-sector tenants stay in Canada. Everyone else is served from the US.
-- Enterprise contracts demand optional dedicated databases and customer-managed keys.
-- Horizontal scale, zero-downtime tenant moves, and per-tenant restore.
+- About 4,000 customers, from 20-person companies to 50,000-person enterprises. That's **1,000 times** difference in size.
+- EU customers' data must stay in the EU, Canadian public-sector data in Canada, and everyone else's in the US.
+- Enterprise contracts can require a dedicated database and encryption keys the customer controls.
+- It must grow by adding machines, move a customer without downtime, and restore one customer's data on its own.
 
-### Architecture decisions
+### Design decisions
 
-**1. Global control plane, regional data planes.** The global plane stores only tenant *metadata*: tenant ID, region, cell, plan, residency tag and epoch. It holds no customer content, which is what makes it legally global. It is replicated read-mostly across regions and cached at the edge.
+**1. One global control system, separate regional data systems.** The global part stores only *information about* customers: ID, region, cell, plan, residency rule and epoch. It stores **no customer content**, which is why it's allowed to be global. It's copied to every region and cached at the edge.
 
-**2. Cells within each region.** A cell is an app tier plus a set of PostgreSQL shards, cache, queue and blob storage. Cells are capped (for example, 500 tenants or 20 TB) so a bad deploy or runaway query has a bounded blast radius. New capacity means new cells, not bigger ones.
+**2. Cells inside each region.** A cell is a complete set: app servers, several PostgreSQL shards, a cache, a queue and file storage. Each cell has a size limit (say 500 customers or 20 TB), so a bad deploy or runaway query affects only that cell. To grow, you add cells, not bigger cells.
 
-**3. Isolation tiers:**
+**3. Isolation levels:**
 
-| Tier | Model | Tenant profile | Trade-offs |
+| Level | How | For | Trade-offs |
 |---|---|---|---|
-| **Pool** | Shared tables + `tenant_id` + RLS | SMB (the vast majority) | Cheapest, densest. Noisy-neighbour risk. Per-tenant restore is hard |
-| **Bridge** | Schema per tenant | Mid-market | Easier per-tenant export. Catalog bloat and migration fan-out at thousands of schemas |
-| **Silo** | Dedicated database or server, customer-managed key via Key Vault | Enterprise and regulated | Strongest isolation and a simple per-tenant restore. Most expensive, and fleet upgrades are harder |
+| **Pool** | Shared tables with a `tenant_id` column and row-level security | Small customers (most of them) | Cheapest and densest. Noisy neighbours are possible. Restoring one customer is hard |
+| **Bridge** | A separate schema per customer | Mid-size | Easier to export one customer. Gets unwieldy with thousands of schemas |
+| **Silo** | A dedicated database or server, with the customer's own key in Key Vault | Enterprise and regulated customers | Strongest isolation and easy restores. Most expensive, and harder to upgrade everywhere |
 
-**4. Placement uses the directory, not consistent hashing.** With a 1,000× size spread, hash placement guarantees some shards hold three enterprise tenants while others idle. Placement is **bin-packing by observed load**, with residency as a hard constraint. Consistent hashing still has a job *inside* the stack: distributing cache keys across a Redis cluster, and partitioning a single giant tenant's event tables.
+**4. Use the lookup table, not consistent hashing, to place customers.** With 1,000× size differences, hashing would put three giants on one shard while others sit idle. Placement is **packing by actual load**, with residency as a strict rule. Consistent hashing still has jobs *inside* the system: spreading cache keys across Redis, and splitting one giant customer's event tables.
 
-**5. Routing and residency enforcement.**
+**5. Routing and keeping data in its country:**
 
-- Tenant subdomains (`acme.app.example`) resolve at the edge to the tenant's region using the cached directory.
-- A request that lands in the wrong region gets a **redirect**, never a cross-region data fetch.
-- Whether transient in-transit processing is acceptable is a legal question for counsel. Design so that **data at rest never leaves the region**, and so that the application refuses cross-region reads by default (the `WrongRegionError` above).
+- Customer subdomains (`acme.app.example`) are sent to the right region at the edge, using the cached directory.
+- A request that reaches the wrong region gets a **redirect**, never a cross-region data fetch.
+- Whether data may briefly pass through another country is a legal question for your lawyers. Design so that **stored data never leaves its region**, and the app refuses cross-region reads by default (the `WrongRegionError` in the code above).
 
-**6. Zero-downtime tenant moves (pool → silo, or cell → cell):**
+**6. Moving a customer without downtime** (from pool to silo, or between cells):
 
-1. Snapshot, then run a CDC or logical-replication stream of that tenant's rows to the target.
-2. Verify with row counts and checksums per table.
-3. Freeze writes briefly (typically seconds). Drain in-flight transactions and let CDC catch up.
-4. **Flip the directory entry and increment the epoch.** Writers holding the old epoch are rejected: fencing once again.
-5. Invalidate caches keyed by epoch, keep the old copy read-only for a grace period, then purge it and record the purge for audit.
+1. Copy a snapshot, then stream that customer's ongoing changes to the new location.
+2. Check that row counts and checksums match for each table.
+3. Pause the customer's writes briefly (usually seconds), and let the change stream catch up.
+4. **Switch the directory entry and increase the epoch.** Writers still using the old epoch are rejected. That's fencing again.
+5. Clear caches, keep the old copy read-only for a while, then delete it and record the deletion for auditors.
 
-**7. Noisy-neighbour controls:** per-tenant rate limits at the gateway, `statement_timeout` per role, PgBouncer pools per tier, and a query-cost budget. Tenants that keep breaching are *moved*, not throttled forever. Being able to move a tenant is the real scalability feature.
+**7. Noisy neighbour controls:** per-customer rate limits, query time limits (`statement_timeout`), connection limits per tier (PgBouncer), and query cost budgets. Customers who keep breaking limits are *moved*, not throttled forever. Being able to move customers is the real scaling feature.
 
 **8. Operational realities:**
 
-- **Schema migrations across ~300 shards** use expand/contract, applied in waves (canary cell first), with a per-shard migration version table. Never run "one big migration".
-- **Per-tenant restore in the pool tier:** point-in-time recovery restores a whole database. Restore to a side instance, extract the tenant's rows by `tenant_id`, and merge them back. This is slow, so sell faster restore as part of the silo tier.
-- **Analytics** run in a per-region lakehouse. Cross-region reporting uses only aggregated, de-identified data.
+- **Schema changes across ~300 shards:** add the new structure first and remove the old one later (expand/contract), in waves (a test cell first), with a migration version table per shard. Never run one big migration.
+- **Restoring one customer in the pool tier:** point-in-time recovery restores the whole database. So restore to a side server, copy out that customer's rows, and merge them back. It's slow, which is a good reason to sell faster restores with the silo tier.
+- **Reports** run in a data lake per region. Reports across regions use only totals, with nothing that identifies a person.
 
-**Azure mapping:** Front Door for global routing. Azure Database for PostgreSQL Flexible Server per shard or silo (zone-redundant HA). Key Vault Managed HSM for customer-managed keys. Azure Policy to deny resource creation outside the allowed regions per subscription (a guardrail that holds even when code is wrong). One subscription or management group per regional stamp.
+**Azure services:** Front Door for global routing. Azure Database for PostgreSQL Flexible Server per shard or silo (zone-redundant HA). Key Vault Managed HSM for customer-controlled keys. Azure Policy to block creating resources outside the allowed regions (a safety net that works even when code is wrong). One subscription or management group per region.
 
-## 4.4 Mermaid: Consistent Hashing Ring — Adding and Removing Nodes
+## 4.4 Diagram: Consistent Hashing Ring — Adding and Removing Nodes
 
-Ring positions run 0–359, and each key belongs to the first node clockwise from it.
+Ring positions run from 0 to 359, and each key belongs to the next server clockwise.
 
 ```mermaid
 flowchart LR
@@ -409,9 +413,9 @@ flowchart LR
 
 *[Open full-size diagram: Consistent hashing ring - adding and removing nodes (SVG)](../diagrams/m4-consistent-hashing-ring-adding-and-removing-nodes.svg)*
 
-With modulo hashing (`hash mod N`), going from 3 to 4 nodes remaps about 75% of keys. Here, one key in four moves in each step. With virtual nodes, the removed node's range would be spread across many successors instead of all falling on A.
+With `hash mod N`, going from 3 to 4 servers moves about 75% of keys. Here, only one key in four moves at each step. With virtual nodes, a removed server's keys would be spread over many servers instead of all going to A.
 
-The WAL commit path, for reference alongside the animation below:
+The WAL write path, to go with the animation below:
 
 ```mermaid
 sequenceDiagram
@@ -441,43 +445,43 @@ sequenceDiagram
 
 *[Open full-size diagram: WAL commit path (SVG)](../diagrams/m4-wal-commit-path.svg)*
 
-## 4.5 Animation Blueprint: A Write Updating the WAL Before the Main Database State
+## 4.5 Animation Plan: A Write Saved to the WAL Before the Main Data
 
-**Scene layout (a 2D `Scene` at 1920×1080):**
+**Scene (2D, 1920×1080):**
 
-- **Left:** *Client*, plus two ghost clients that appear later to show group commit.
+- **Left:** a *Client*, plus two faint extra clients that appear later to show group commit.
 - **Centre:** the *Postgres backend* process box.
 - **Top centre:** a grid of 16 page tiles labelled *Shared buffers (RAM)*.
-- **Right centre:** a horizontal *WAL buffer* strip.
-- **Bottom right:** *WAL on disk*, drawn as a tape with LSN tick marks.
-- **Bottom left:** *Heap data files on disk*, a grid mirroring the RAM tiles.
+- **Right centre:** a *WAL buffer* strip.
+- **Bottom right:** *WAL on disk*, drawn as a tape with log number (LSN) marks.
+- **Bottom left:** *Data files on disk*, a grid matching the RAM tiles.
 - **Top right:** an LSN counter.
-- **Far right, faded:** a *Sync standby*, used in the final act.
+- **Far right, faded:** a *Sync standby*, used at the end.
 
-| Time | Beat | Visual | Manim primitives |
+| Time | Step | What you see | Manim tools |
 |---|---|---|---|
-| 0:00–0:03 | **Request** | A SQL card `UPDATE accounts SET balance=80 WHERE id=7` slides from Client to the backend | `MoveToTarget`, `Write` |
-| 0:03–0:06 | **Locate page** | Heap tile 42 glows. A copy flies up into the RAM grid (a cache miss). Its label reads `balance=100, pageLSN=0/16B3E80` | `TransformFromCopy`, `Indicate` |
-| 0:06–0:10 | **Generate WAL** | A WAL record block `LSN 0/16B3F20: heap update p42 s3` materializes *first* and slides into the WAL buffer. The LSN counter ticks | `FadeIn(shift=RIGHT)`, `ChangeDecimalToValue` |
-| 0:10–0:13 | **Modify in memory** | The RAM tile updates to `balance=80`, turns orange (*dirty*) and is re-stamped `pageLSN=0/16B3F20`. A padlock icon with a thin line ties the tile to the WAL record. Caption: *This page may not reach disk until the WAL up to its LSN does* | `Transform`, `set_fill(ORANGE)`, `Line` |
-| 0:13–0:16 | **COMMIT** | The client sends `COMMIT`. A commit record joins the buffer. Two ghost clients add their own commit records alongside it | `LaggedStart(FadeIn)` |
-| 0:16–0:20 | **Group commit fsync** | The three records slide as one group onto the disk tape. A single **fsync** flash fires and a disk LED blinks once. Caption: *One fsync, three durable commits* | `AnimationGroup`, `Flash`, `ShowPassingFlash` along the tape |
-| 0:20–0:23 | **Acknowledge** | `COMMIT OK` returns to all three clients. The heap tile at bottom left **still shows `balance=100`**. Caption: *Durable is not the same as written to the data file* | `Indicate(heap_tile, color=YELLOW)` |
-| 0:23–0:28 | **Checkpoint** (fast-forward) | A clock spins. The checkpointer sweeps the RAM grid, dirty tiles flow down into the heap grid (random writes, drawn as scattered arrows) and turn white. A `CHECKPOINT redo=…` marker drops onto the WAL tape | `Rotate(clock_hand)`, `LaggedStart(TransformFromCopy)` |
-| 0:28–0:30 | **Rewind** | Rewind to 0:23 (after the ack, before the checkpoint) | Reverse `ValueTracker` or `Restore` |
-| 0:30–0:33 | **Crash** | A lightning bolt strikes. The RAM grid shatters into fragments and fades: *shared buffers lost*. The disk tape and the heap survive | `Create(lightning)`, `ShrinkToCenter` on fragments |
-| 0:33–0:40 | **Redo recovery** | A *startup process* cursor jumps to the last checkpoint's redo point on the tape and scans forward. At record `0/16B3F20`, it looks up heap page 42 and shows a comparison bubble: `pageLSN 0/16B3E80 < 0/16B3F20 → REPLAY`. The page reloads into RAM and becomes `balance=80`. A second record whose page is already newer shows `pageLSN ≥ record LSN → SKIP` | `MoveAlongPath(cursor)`, comparison `MathTex`, `Transform` |
-| 0:40–0:44 | **Uncommitted work** | A third, uncommitted transaction's record is also replayed, but the commit-log (CLOG) panel marks it *in progress → aborted*, so its tuple renders greyed-out and invisible. Caption: *PostgreSQL needs no undo: MVCC hides it* | `set_opacity(0.25)`, CLOG `Table` update |
-| 0:44–0:52 | **Replication** (bonus) | Replay the commit with the standby lit. The WAL stream flows to the standby's own tape, and the client's `COMMIT OK` arrow waits at a gate until the standby's `flushed up to Y` ack returns. A latency meter shows the extra RTT | `ShowPassingFlash`, gate `Rectangle` sliding open |
-| 0:52–0:56 | **Recap** | Three stacked rules: *1. Log before data. 2. Flush log before ack. 3. Redo is idempotent via pageLSN* | `Write`, `LaggedStart` |
+| 0:00–0:03 | **Request** | A card saying `UPDATE accounts SET balance=80 WHERE id=7` slides from Client to the backend | `MoveToTarget`, `Write` |
+| 0:03–0:06 | **Find the page** | Disk tile 42 glows, and a copy flies up into RAM (it wasn't cached). It shows `balance=100, pageLSN=0/16B3E80` | `TransformFromCopy`, `Indicate` |
+| 0:06–0:10 | **Write the log entry first** | A log block `LSN 0/16B3F20: update page 42 slot 3` appears *first* and slides into the WAL buffer. The LSN counter goes up | `FadeIn`, counter change |
+| 0:10–0:13 | **Change the page in memory** | The RAM tile changes to `balance=80`, turns orange (*dirty*) and is stamped `pageLSN=0/16B3F20`. A padlock links it to the log entry. Caption: *This page can't go to disk until its log entry does* | `Transform`, orange fill, `Line` |
+| 0:13–0:16 | **COMMIT** | The client sends `COMMIT` and a commit entry joins the buffer. The two extra clients add their own commit entries alongside | `LaggedStart(FadeIn)` |
+| 0:16–0:20 | **One disk sync for all three** | The three entries slide together onto the disk tape, one **fsync** flash fires, and a disk light blinks once. Caption: *One sync, three safe commits* | `AnimationGroup`, `Flash` |
+| 0:20–0:23 | **Reply** | `COMMIT OK` goes back to all three clients. The disk tile at bottom left **still says `balance=100`**. Caption: *Safe doesn't mean written to the data file yet* | Yellow `Indicate` on the disk tile |
+| 0:23–0:28 | **Checkpoint** (fast forward) | A clock spins. The checkpointer sweeps the RAM grid, dirty tiles flow down to the disk grid (scattered arrows) and turn white. A `CHECKPOINT` marker drops onto the tape | Rotating hand, `LaggedStart` |
+| 0:28–0:30 | **Rewind** | Rewind to 0:23 (after the reply, before the checkpoint) | `Restore` |
+| 0:30–0:33 | **Crash** | Lightning strikes. The RAM grid shatters and fades: *memory lost*. The disk tape and data files survive | Lightning, shrinking fragments |
+| 0:33–0:40 | **Recovery** | A cursor jumps to the last checkpoint on the tape and moves forward. At entry `0/16B3F20` it checks disk page 42: `pageLSN 0/16B3E80 < 0/16B3F20 → REPLAY`. The page reloads and becomes `balance=80`. Another entry, whose page is already newer, shows `→ SKIP` | Moving cursor, comparison text, `Transform` |
+| 0:40–0:44 | **Unfinished work** | A third, uncommitted transaction's entry is replayed too, but the commit-status panel shows it was never committed. Its row appears greyed out and invisible. Caption: *PostgreSQL needs no undo step: MVCC hides it* | Low opacity, status table update |
+| 0:44–0:52 | **Replica** (bonus) | Replay the commit with the standby shown. The log flows to the standby's tape, and the client's `COMMIT OK` waits at a gate until the standby confirms. A meter shows the extra wait | `ShowPassingFlash`, sliding gate |
+| 0:52–0:56 | **Summary** | Three rules: *1. Log before data. 2. Save the log before replying. 3. Replay is safe to repeat, thanks to pageLSN* | `Write`, `LaggedStart` |
 
-## 4.6 Staff-level Review Questions
+## 4.6 Review Questions
 
-- Which queries fan out across shards, and what is their p99 under a single slow shard?
-- Can we move one tenant between cells today, and how long is the write freeze?
-- What prevents a request in the EU region from reading a Canadian tenant's rows: code, the network, policy, or all three?
-- What is our actual RPO, for each database, under the current `synchronous_commit` and standby configuration?
-- If the tenant directory is unavailable for 10 minutes, what still works?
+- Which queries touch every shard, and how slow are they when one shard is slow?
+- Can we move one customer between cells today? How long are their writes paused?
+- What stops a request in the EU region from reading a Canadian customer's data: code, the network, cloud policy, or all three?
+- For each database, how much data could we actually lose with the current commit and standby settings?
+- If the customer directory is down for 10 minutes, what still works?
 
 ---
 

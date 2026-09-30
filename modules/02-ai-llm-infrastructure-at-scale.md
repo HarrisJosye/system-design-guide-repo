@@ -2,7 +2,7 @@
 
 *Industry: Generative AI & Autonomous Agents*
 
-## 2.1 Core Theory & Trade-offs
+## 2.1 Ideas & Trade-offs
 
 ### Vector databases and ANN indexing
 
@@ -24,39 +24,45 @@ flowchart LR
 
 *[Open full-size diagram: Hybrid retrieval pipeline (SVG)](../diagrams/m2-hybrid-retrieval-pipeline.svg)*
 
-Exact k-nearest-neighbour search costs `O(N·d)` per query. For 10M chunks at 1,024 dimensions, that is about 10¹⁰ multiply-adds per query. This is fine as a one-off on a GPU and hopeless at thousands of QPS. **Approximate nearest neighbour (ANN)** indexes trade *recall* for *latency and memory*. Every index decision is a position on that three-way trade-off.
+**In plain words:** an **embedding** turns text into a list of numbers (a **vector**), so texts with similar meaning get similar numbers. A **vector database** stores millions of these and quickly finds the ones closest to a question's vector.
 
-**HNSW (Hierarchical Navigable Small World)** is a multi-layer proximity graph. Think of it as a skip list crossed with a small-world graph:
+Checking every vector one by one is exact but slow. For 10 million chunks of 1,024 numbers each, that's about 10 billion multiplications per question. **ANN (approximate nearest neighbour)** indexes find *almost* the best matches much faster. Every index choice is a balance between three things:
 
-- Each vector is assigned a maximum layer drawn from an exponentially decaying distribution (`level = ⌊−ln(U) · mL⌋`). Most nodes exist only on layer 0, and a few reach the sparse top layers.
-- **Search:** start at the entry point on the top layer, greedily hop to whichever neighbour is closest to the query, and descend a layer when no neighbour improves. On layer 0, run a beam search that keeps the best `ef_search` candidates in a priority queue.
-- **Parameters:**
-  - `M` is the number of neighbours per node (layer 0 usually keeps `2M`). A higher M gives better recall and more memory.
-  - `ef_construction` is the build-time beam width. A higher value gives a better graph and a slower build.
-  - `ef_search` is the query-time beam width. It is the **runtime recall/latency knob**, and it can be tuned per query.
-- **Memory:** vectors plus graph edges. For 10M × 1,024-dim float32 vectors, that is ~41 GB of vectors plus ~2–3 GB of graph at M=16–32. It is **RAM-resident**.
-- **Weaknesses:** deletes are tombstones that degrade graph quality, so plan periodic rebuilds. Builds are slow. Highly selective metadata filters break graph connectivity (see below).
+- **recall**: how often the true best matches are found;
+- **speed**;
+- **memory**.
 
-**Alternatives:**
+**HNSW (Hierarchical Navigable Small World)** is the most popular index. Think of it as a stack of road maps:
 
-| Index | Mechanism | Memory | Recall at fixed latency | Updates | When to use |
+- The **top map** has only a few cities with long highways between them. Lower maps have more cities and shorter roads. The **bottom map** has every point.
+- **Searching:** start at the top, keep moving to whichever neighbour is closest to your question, and drop down a level when you can't get any closer. On the bottom level, keep a shortlist of the best `ef_search` candidates while exploring.
+- **Settings:**
+  - `M` is the number of neighbours each point links to. More means better recall and more memory.
+  - `ef_construction` is how carefully the index is built. Higher gives a better index but builds more slowly.
+  - `ef_search` is how widely to search at question time. This is the **main knob for accuracy vs. speed**, and you can change it for each query.
+- **Memory:** 10 million vectors × 1,024 floats ≈ 41 GB, plus 2–3 GB for the links. **It all lives in RAM.**
+- **Weaknesses:** deleting items leaves gaps that slowly make the index worse, so it needs occasional rebuilds. Building is slow. Strict filters (see below) can break it.
+
+**Other index types:**
+
+| Index | How it works | Memory | Accuracy at the same speed | Updates | Use when |
 |---|---|---|---|---|---|
-| Flat (brute force) | Exact scan, often on GPU | 1× | 100% | Trivial | Fewer than ~1M vectors, or small pre-filtered subsets |
-| **HNSW** | Multi-layer graph | ~1.1–1.5× | Excellent | Good inserts, poor deletes | The default for fewer than ~100M vectors in RAM |
-| IVF-Flat | k-means into `nlist` cells, probe `nprobe` | ~1× | Good | Cheap. Retrain when drift occurs | Large corpora, GPU (FAISS) |
-| IVF-PQ | IVF + product quantization (e.g. 1,024-d float32 = 4 KB → 64 B) | ~0.02× | Lower. Rerank with full vectors | Retrain codebooks | Billions of vectors, cost-bound |
-| DiskANN / Vamana | SSD-resident graph + compressed vectors in RAM | Mostly SSD | Very good | Good | Hundreds of millions of vectors without a RAM budget for HNSW |
+| Flat (check everything) | Exact scan, often on a GPU | 1× | 100% | Easy | Under ~1M vectors, or small filtered subsets |
+| **HNSW** | Layered graph | ~1.1–1.5× | Excellent | Adds are fine, deletes are poor | The default for under ~100M vectors in RAM |
+| IVF-Flat | Group vectors into clusters and search only the nearest clusters | ~1× | Good | Cheap. Retrain when data changes | Large collections, GPU |
+| IVF-PQ | Clusters plus compression (a 4 KB vector becomes 64 bytes) | ~0.02× | Lower. Re-check the top results with full vectors | Retrain | Billions of vectors, on a tight budget |
+| DiskANN | Graph stored on SSD, compressed vectors in RAM | Mostly SSD | Very good | Good | Hundreds of millions of vectors without the RAM for HNSW |
 
-Scalar quantization (int8, 4× smaller) usually costs 1–2 points of recall. Binary quantization (32× smaller) needs a rescoring pass. Always **normalize** embeddings, so that cosine similarity equals dot product and the index can use the cheaper metric.
+Smaller number formats also help: 8-bit numbers use 4× less memory and lose 1–2 points of accuracy, and 1-bit uses 32× less but needs a re-check step. Always **normalize** vectors (scale them to length 1), so the cheaper dot-product calculation gives the same answer as cosine similarity.
 
-**The filtered-search trap.** Enterprise RAG *always* filters: by tenant, jurisdiction, document version, or ACL.
+**The filtering trap.** Business apps always filter, for example by customer, country, document version or who is allowed to see what.
 
-- **Post-filtering** (retrieve top-k, then filter) can return zero results when the filter is selective, because the true matches were never in the top-k.
-- **Pre-filtering** (filter, then brute-force the subset) is exact and fast when the subset is small.
-- **In-traversal filtering** (skip non-matching nodes during the graph walk) degrades sharply as selectivity rises, because the graph fragments into disconnected islands.
-- **Principal answer:** when the filter is a *security or residency boundary*, **partition the index** (per tenant or per jurisdiction) instead of filtering. You get isolation you can audit, predictable recall, and per-partition lifecycle. Reserve metadata filters for soft relevance constraints.
+- **Filter after searching:** find the top 10, then remove those that fail the filter. You might end up with zero results.
+- **Filter before searching:** pick the allowed items, then check them all exactly. This is fast when the allowed set is small.
+- **Filter during the search:** skip disallowed points while walking the graph. With strict filters, the graph falls apart into disconnected islands and results get worse.
+- **Best answer:** when the filter is a **security or legal boundary**, keep **separate indexes** (per customer or per country) instead of filtering. You get isolation you can prove, stable accuracy, and simpler management. Use filters only for "nice to have" relevance rules.
 
-**Hybrid retrieval.** Dense embeddings are weak on exact tokens such as policy numbers, SKUs, and names like "Reg E". Run BM25 and dense search in parallel and fuse them with **Reciprocal Rank Fusion**, `score(d) = Σ 1 / (k + rank_i(d))` with k ≈ 60. Then apply a **cross-encoder reranker** to the top ~50 to pick the final 5–8. The reranker usually adds 30–150 ms and is usually the single biggest quality gain in the pipeline.
+**Hybrid search.** Embeddings are weak at exact words such as policy numbers, product codes and names like "Reg E". So also run a **keyword search (BM25)** in parallel, and merge the two result lists with **Reciprocal Rank Fusion**: each result scores `1 / (60 + its rank)` in each list, and the scores are added. Then a **reranker** model (a cross-encoder) re-scores the top ~50 and picks the best 5–8. It adds about 30–150 ms, and it's usually the single biggest quality improvement.
 
 ### Retrieval-Augmented Generation (RAG) pipelines
 
@@ -77,26 +83,28 @@ flowchart LR
 
 *[Open full-size diagram: RAG - offline ingestion and online query paths (SVG)](../diagrams/m2-rag-offline-ingestion-and-online-query-paths.svg)*
 
-**Ingestion path (offline or near-real-time):**
-Source (SharePoint, CMS, PDFs) → layout-aware parsing that keeps tables and headings → chunking → metadata enrichment (`doc_id`, `version`, `effective_date`, `jurisdiction`, `acl`) → embedding → upsert.
+**In plain words:** RAG means "look up the right documents first, then ask the AI to answer using them". It keeps answers based on your real documents instead of the model's memory.
 
-- **Versioning is a correctness issue.** When compliance guideline v7 supersedes v6, v6 chunks must stop being retrievable *atomically*. Store `doc_version` plus an `active` flag, or build a new index and swap an alias.
-- **Changing embedding models means re-embedding the whole corpus.** Vectors from different models live in incompatible spaces. Blue/green the index.
+**Preparing documents (done ahead of time):**
+Documents (SharePoint, CMS, PDFs) → read the layout, keeping tables and headings → split into **chunks** → add labels (document ID, version, effective date, country, who can see it) → create embeddings → save to the index.
 
-**Chunking trade-offs:**
+- **Versions matter for correctness.** When policy v7 replaces v6, the v6 chunks must stop showing up *at once*. Store a version and an `active` flag, or build a new index and switch over in one step.
+- **A new embedding model means re-processing everything.** Vectors from different models can't be compared. Build the new index alongside the old one and then switch.
+
+**How to split documents (chunking):**
 
 | Choice | Effect |
 |---|---|
-| Small chunks (200–400 tokens) | Precise matches, but the chunk loses surrounding context and needs more chunks per answer |
-| Large chunks (800–1,500 tokens) | Context preserved, but the embedding is diluted and the prompt costs more tokens |
-| Overlap (10–20%) | Protects sentences split across boundaries, at the cost of index size |
-| Structure-aware (split on headings) | The best default for policy documents |
-| Parent–child ("small-to-big") | Retrieve on small chunks, feed the parent section to the LLM |
-| Contextual header | Prepend `Document › Section › Subsection` to each chunk *before* embedding. It is cheap and noticeably improves recall |
+| Small chunks (200–400 tokens) | Precise matches, but each chunk has less context, so you need more of them |
+| Large chunks (800–1,500 tokens) | More context, but the meaning gets blurred and prompts cost more |
+| Overlap (10–20%) | Sentences split across two chunks are still found. The index is bigger |
+| Split on headings | The best default for policy documents |
+| "Small to big" | Search small chunks, but give the AI the whole section they came from |
+| Add a header | Put `Document › Section › Subsection` at the top of each chunk *before* creating the embedding. It's cheap and noticeably improves results |
 
-**Query path:** input guardrails → conversational query rewrite (turn "what about abroad?" into a standalone question) → hybrid retrieval → rerank → context assembly under a token budget → generation with citations → output checks (grounding, PII, required disclosures).
+**Answering a question:** safety checks → rewrite the question so it makes sense on its own ("what about abroad?" becomes a full question) → hybrid search → rerank → build the prompt within a token budget → generate an answer with citations → final checks (is it backed by the sources? any personal data? required disclaimers?).
 
-**Evaluate retrieval separately from generation.** Most "the LLM hallucinated" incidents are actually retrieval failures: the right chunk never reached the prompt. Track recall@k and MRR on a golden question set in CI, and faithfulness and groundedness on sampled production traffic.
+**Test the search separately from the answer.** Most "the AI made things up" problems are really search problems: the right chunk never reached the prompt. Measure how often the right chunk is in the top results on a fixed set of test questions, in your CI pipeline. Separately, check whether answers stick to their sources, on sampled real traffic.
 
 ### Stream processing and long-lived connections
 
@@ -117,23 +125,25 @@ flowchart LR
 
 *[Open full-size diagram: Token streaming with backpressure and cancellation (SVG)](../diagrams/m2-token-streaming-with-backpressure-and-cancellation.svg)*
 
+**Streaming the answer.** Users see the answer appear word by word instead of waiting. Two ways to do that:
+
 | | Server-Sent Events (SSE) | WebSocket |
 |---|---|---|
-| Direction | Server → client | Bidirectional |
-| Protocol | Plain HTTP, works over HTTP/2 multiplexing | Upgrade handshake, then its own framing |
-| Proxies and WAFs | Pass through easily | Often need explicit configuration |
-| Reconnection | Built in, with `Last-Event-ID` | Hand-rolled |
-| Best for | **Token streaming** | Barge-in, voice, collaborative agents |
+| Direction | Server → browser | Both ways |
+| Protocol | Normal HTTP | A special upgraded connection |
+| Through proxies and firewalls | Easy | Often needs extra setup |
+| Reconnecting | Built in (`Last-Event-ID`) | You build it yourself |
+| Best for | **Streaming AI answers** | Voice, interrupting mid-answer, collaborative agents |
 
-For a chat bot, SSE is the default. Cancelling mid-stream can be a separate `POST /cancel`.
+For a chatbot, SSE is the default. If the user presses "stop", that can be a separate `POST /cancel` request.
 
-**What actually limits 50k concurrent connections:**
+**What actually limits 50,000 open connections:**
 
-- **Memory is not the problem.** An idle asyncio connection costs tens of KB (socket buffers, TLS state, a coroutine frame), so 50k connections fit comfortably in a handful of pods.
-- **Idle timeouts at load balancers** kill quiet streams while the model is still prefilling. Send an SSE comment (`: ping`) every ~15 s, and check every hop's idle timeout.
-- **Buffering** breaks streaming silently. Disable proxy buffering (`X-Accel-Buffering: no` on nginx) and **disable gzip middleware** on stream routes, because compressors buffer.
-- **Backpressure:** a slow client must not cause unbounded memory growth. Use a bounded per-stream queue, and drop the connection if it stays full.
-- **Cancel on disconnect:** a closed browser tab must free its GPU slot *immediately*. Otherwise abandoned generations consume a real share of fleet capacity.
+- **Memory isn't the problem.** An idle connection in async Python uses tens of KB, so 50,000 connections fit on a few servers.
+- **Load balancers close quiet connections.** While the model is still "thinking", nothing is sent, and a load balancer may close the stream. Send a small comment line (`: ping`) every ~15 seconds, and check the idle timeout at every hop.
+- **Buffering silently breaks streaming.** Turn off proxy buffering (`X-Accel-Buffering: no` on nginx) and **turn off gzip** on streaming routes, because compression waits to collect data.
+- **Backpressure.** A slow client must not make memory grow forever. Use a small queue for each stream, and drop the connection if it stays full.
+- **Stop generating when the user leaves.** A closed browser tab must free its GPU slot *straight away*. Otherwise abandoned answers waste a real share of your GPUs.
 
 ### Model serving optimization
 
@@ -153,12 +163,12 @@ flowchart LR
 
 *[Open full-size diagram: LLM inference - prefill, KV cache, decode (SVG)](../diagrams/m2-llm-inference-prefill-kv-cache-decode.svg)*
 
-LLM inference has two phases with opposite bottlenecks:
+An LLM answers in two phases that are slow for opposite reasons:
 
-- **Prefill** processes the whole prompt in parallel. It is **compute-bound** and sets **time-to-first-token (TTFT)**.
-- **Decode** produces one token per step per sequence. It is **memory-bandwidth-bound** and sets **time-per-output-token (TPOT)**.
+- **Prefill** reads the whole prompt in one go. It's limited by **compute power**, and it decides the **time to first token (TTFT)**.
+- **Decode** writes the answer one token at a time. It's limited by **memory speed**, and it decides the **time per output token (TPOT)**.
 
-**The KV cache is the capacity constraint**, not FLOPs:
+**The KV cache is the real limit, not compute power.** While writing an answer, the model keeps a working memory (the "KV cache") for every token in the conversation:
 
 ```
 KV bytes per token = 2 (K and V) × layers × kv_heads × head_dim × bytes_per_value
@@ -167,22 +177,22 @@ KV bytes per token = 2 (K and V) × layers × kv_heads × head_dim × bytes_per_
 A 4,000-token conversation ≈ 1.3 GB of GPU memory for a single sequence
 ```
 
-Concurrency per GPU is therefore bounded by KV memory. The serving optimizations mostly exist to stretch that budget:
+So how many conversations one GPU can handle depends mostly on this memory. Most serving tricks exist to stretch it:
 
 | Technique | What it does | Trade-off |
 |---|---|---|
-| **Continuous batching** (vLLM, TGI, TensorRT-LLM, SGLang) | Schedules at the iteration level, so new sequences join the batch mid-flight | Larger batches raise throughput *and* raise TPOT. Tune `max_num_seqs` to your SLO |
-| **PagedAttention** | Allocates KV in fixed blocks, eliminating fragmentation | Standard practice now |
-| **Prefix caching** | Reuses KV for a shared prompt prefix (system prompt, static policy text) | Huge win for RAG. Requires *cache-affinity routing* to the replica that holds the prefix |
-| **Quantization** (FP8/INT8/INT4 weights, FP8 KV) | Roughly 2–4× more memory for KV | Quality regression must be measured on *your* eval set |
-| **Speculative decoding** | A small draft model proposes tokens and the large model verifies them | Output-equivalent, but gains depend on acceptance rate. Uses extra memory |
-| **Chunked prefill** | Splits long prefills so they don't stall running decodes | Slightly higher TTFT for long prompts in exchange for stable TPOT |
-| **Prefill/decode disaggregation** | Separate GPU pools for each phase | Best efficiency at scale, but you must transfer KV between pools |
-| **Model tiering** | A small model for intent and routing, the large model only when needed | Adds a routing hop, cuts cost dramatically |
+| **Continuous batching** (vLLM, TGI, TensorRT-LLM, SGLang) | New requests join the running batch at every step instead of waiting for it to finish | Bigger batches mean more total speed but slower tokens per user. Tune `max_num_seqs` to your target |
+| **PagedAttention** | Stores the KV cache in small fixed pages, so no memory is wasted on gaps | Standard now |
+| **Prefix caching** | Reuses the KV cache for a shared start of the prompt (system prompt, fixed policy text) | Huge win for RAG. Requests must be sent to the server that already has that prefix |
+| **Quantization** (8-bit or 4-bit numbers) | 2–4× more room for the KV cache | Quality may drop, so test on *your* questions |
+| **Speculative decoding** | A small model guesses the next few tokens, and the big model checks them in one go | Same output, faster, depending on how often the guesses are right. Uses extra memory |
+| **Chunked prefill** | Splits long prompts so they don't freeze answers already being written | Slightly slower first token for long prompts |
+| **Separate prefill and decode servers** | Different GPU pools for each phase | Best efficiency at large scale, but the KV cache must be moved between them |
+| **Model tiers** | A small model handles simple questions, the big one only when needed | One extra routing step, but much cheaper |
 
-## 2.2 Python in Practice: Async Streaming, Chunking, GPU Queues
+## 2.2 Python: Async Streaming, Chunking, GPU Queues
 
-### SSE gateway with admission control, heartbeats, backpressure and cancellation
+### A streaming endpoint with limits, heartbeats, backpressure and cancelling
 
 ```python
 import asyncio
@@ -262,9 +272,9 @@ async def chat_stream(req: Request, body: ChatIn):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 ```
 
-The `locked()` pre-check is not atomic. It is a cheap load-shedding hint, and the timed `acquire` inside the generator is the real gate. Recent Starlette versions also cancel the generator when a send fails, but polling `is_disconnected()` covers the time-to-first-token window, when nothing is being sent yet.
+The `locked()` check at the top isn't perfectly accurate. It's a cheap way to turn people away early, and the timed `acquire` inside is the real limit. Newer Starlette versions also cancel the generator when sending fails, but checking `is_disconnected()` also covers the time before the first token, when nothing has been sent yet.
 
-### Structure-aware token chunking
+### Splitting documents into chunks by tokens
 
 ```python
 from collections.abc import Callable, Iterator, Sequence
@@ -304,9 +314,9 @@ def chunk_section(
                     f"{section_path}\n\n{decode(window)}", start)
 ```
 
-Split on headings first (one call per section), then use the token window only inside long sections. In production, snap window edges to sentence boundaries, because raw token windows can cut mid-word.
+Split by headings first (one call per section), then use the token window only inside long sections. In production, move the window edges to sentence boundaries, because raw token windows can cut words in half.
 
-### GPU-bound embedding workers with Ray Serve dynamic batching
+### GPU workers for embeddings, with automatic batching (Ray Serve)
 
 ```python
 from ray import serve
@@ -334,13 +344,19 @@ class Embedder:
 embedder_app = Embedder.bind()
 ```
 
-The trade-off is explicit: `batch_wait_timeout_s=0.01` adds up to 10 ms of latency in exchange for GPU utilization that can be an order of magnitude higher. Check the autoscaling key names against your Ray version, because they have been renamed across releases. For CPU-bound steps such as PDF parsing or tokenizing large documents in the gateway, use `loop.run_in_executor(ProcessPoolExecutor(), ...)`. Threads won't help because of the GIL (free-threaded CPython 3.13+ is still maturing).
+The trade-off is clear: waiting up to 10 ms (`batch_wait_timeout_s=0.01`) adds a little delay, but the GPU can do far more work per second by processing many texts at once. Check the autoscaling setting names for your Ray version, because they've changed over time. For CPU-heavy work in Python (reading PDFs, tokenizing big documents), use `ProcessPoolExecutor`. Threads won't help because of Python's GIL.
 
 ## 2.3 Case Study: An Enterprise AI Customer-Service Bot for 50,000 Concurrent Users
 
-**Requirements:** a bank's assistant that (a) fetches real-time account data (balances, recent transactions, card status), (b) retrieves compliance guidelines with citations, and (c) streams responses token by token. TTFT p95 under 1.5 s and ≥ 20 tokens/s per stream. **Zero cross-customer data leakage.** Full auditability.
+**Requirements:** a bank's assistant that:
 
-### Capacity math: "50k concurrent" is not the number that matters
+- looks up live account data (balances, recent transactions, card status);
+- finds compliance rules, with citations;
+- streams answers word by word.
+
+95% of users see the first word within 1.5 seconds, with at least 20 tokens/s after that. **No customer can ever see another customer's data.** Everything must be auditable.
+
+### Rough numbers: "50,000 connected" is not the number that matters
 
 ```mermaid
 flowchart LR
@@ -355,56 +371,56 @@ flowchart LR
 
 *[Open full-size diagram: Little's Law sizing for the chat bot (SVG)](../diagrams/m2-little-s-law-sizing-for-the-chat-bot.svg)*
 
-Apply Little's Law (`L = λ × W`) with explicit assumptions:
+We use **Little's Law**: *average number of things in progress = arrival rate × time each one takes*.
 
 | Assumption | Value |
 |---|---|
 | Connected users | 50,000 |
-| Mean think time between messages | 90 s |
-| Output length / decode speed | 400 tokens at 30 tok/s ≈ 13 s |
-| TTFT (retrieval + prefill) | ~1 s |
-| Prompt size (system + 5 chunks + history + account JSON) | ~3,000 tokens |
+| Average time between a user's messages | 90 s |
+| Answer length / writing speed | 400 tokens at 30 tokens/s ≈ 13 s |
+| Time to first token (search + prefill) | ~1 s |
+| Prompt size (system + 5 chunks + history + account data) | ~3,000 tokens |
 
-| Derived quantity | Value |
+| Result | Value |
 |---|---|
-| Arrival rate λ | 50,000 / 90 ≈ **555 requests/s** |
-| Concurrent generations L | 555 × 14 s ≈ **7,800 sequences decoding at once** |
-| Aggregate decode throughput | 7,800 × 30 ≈ **234k output tokens/s** |
-| Aggregate prefill | 555 × 3,000 ≈ **1.7M prompt tokens/s** (an 800-token cached prefix removes ~25%) |
-| Live KV cache at 70B class | ~7,800 × ~3,400 tokens × 320 KB ≈ **8–9 TB of KV memory** |
+| New requests per second | 50,000 / 90 ≈ **555 per second** |
+| Answers being written at the same moment | 555 × 14 s ≈ **7,800** |
+| Output tokens per second, in total | 7,800 × 30 ≈ **234,000** |
+| Prompt tokens read per second | 555 × 3,000 ≈ **1.7 million** (a cached shared start of ~800 tokens removes ~25%) |
+| KV cache memory needed (70B-size model) | ~7,800 × ~3,400 tokens × 320 KB ≈ **8–9 TB** |
 
-That last row drives the design. At 70B-class scale, self-hosting this workload means a GPU fleet in the hundreds before any redundancy. The levers, in order of impact:
+That last row changes everything. Running this yourself with a 70B model needs hundreds of GPUs before any spares. The biggest levers, in order:
 
-1. **Tier the models.** Most banking intents ("what's my balance", "freeze my card") need a small model plus a tool call, or no generative model at all. Route only complex policy questions to the large model.
-2. **Cap output tokens** and keep answers concise. Output length drives W linearly.
-3. **Keep prompts short.** Five tight chunks beat twelve loose ones for both quality and KV cost.
-4. **Buy instead of build.** A managed service with reserved capacity (Azure OpenAI provisioned throughput, Bedrock provisioned throughput, Vertex) converts GPU operations into a capacity contract. Self-hosting (vLLM on AKS GPU node pools) wins on unit cost only at sustained high utilization, with an MLOps team to run it.
+1. **Use model tiers.** Most banking questions ("what's my balance?", "freeze my card") need a small model plus one tool call, or no AI at all. Send only complex policy questions to the big model.
+2. **Limit answer length** and keep answers short. Answer length drives the numbers directly.
+3. **Keep prompts short.** Five good chunks beat twelve loose ones, for quality and for cost.
+4. **Buy instead of build.** A managed service with reserved capacity (Azure OpenAI provisioned throughput, Bedrock, Vertex) turns GPU operations into a contract. Running it yourself (vLLM on AKS GPU nodes) is cheaper only if the GPUs are busy most of the time and you have a team to run them.
 
-### Reference architecture decisions
+### Design decisions
 
-- **Stateless stream gateways.** Conversation state lives in Redis or Cosmos DB, so any pod can serve any turn. A short replay buffer (Redis Streams, ~60 s) supports SSE resume via `Last-Event-ID`.
-- **Parallel fan-out to cut TTFT.** The orchestrator runs account-data fetch, retrieval and conversation-history load concurrently (`asyncio.TaskGroup`), so TTFT is `max(...)`, not the sum.
-- **The LLM is never the authority on identity.** The customer ID comes from the *authenticated session*, and the account tool calls core banking with the user's delegated token (on-behalf-of flow). The model can ask for "my recent transactions". It can never choose *whose*. This single rule prevents the most damaging class of prompt-injection incidents.
-- **Retrieved content is untrusted input.** Indirect prompt injection can hide inside ingested documents. Keep tool-calling permissions minimal and require confirmation for anything that changes state.
-- **Retrieval:** hybrid BM25 + HNSW with semantic reranking (Azure AI Search, or pgvector/Qdrant plus a reranker), filtered by product, jurisdiction and `effective_date`, with index partitions per regulatory region.
+- **Stateless streaming servers.** Conversation state lives in Redis or Cosmos DB, so any server can handle any message. A short replay buffer (~60 s) lets clients resume a dropped stream.
+- **Do lookups at the same time.** Fetch account data, search documents and load history in parallel (`asyncio.TaskGroup`). The wait is then the slowest of the three, not all three added together.
+- **The AI never decides whose data to fetch.** The customer ID comes from the *logged-in session*. The account tool calls the core banking system with the user's own token. The model can ask for "my recent transactions" but can never choose *whose*. This one rule prevents the most damaging kind of prompt-injection attack.
+- **Treat retrieved documents as untrusted.** Documents can contain hidden instructions ("indirect prompt injection"). Give tools the fewest permissions possible, and require confirmation for anything that changes data.
+- **Search:** keyword + HNSW hybrid search with reranking (Azure AI Search, or pgvector/Qdrant plus a reranker), filtered by product, country and effective date, with separate indexes per regulated region.
 - **Caching, from safest to riskiest:**
 
 | Layer | Key | Rule |
 |---|---|---|
-| Embedding cache | hash(text, model_version) | Always safe |
-| Retrieval cache | hash(rewritten query, corpus_version, filters) → chunk IDs | Safe with a short TTL |
-| Prefix/KV cache (model server) | Token prefix | Safe. Largest cost win |
-| Exact response cache | Normalized query + corpus_version, **non-personalized intents only** | Allowed for FAQs |
-| Semantic response cache | Embedding similarity above a strict threshold | **Only for compliance-approved, non-personalized answers.** Never for anything that touched account data. A near-miss match returns another customer's context |
+| Embedding cache | hash(text, model version) | Always safe |
+| Search result cache | hash(rewritten question, index version, filters) → chunk IDs | Safe with a short TTL |
+| Prefix cache (on the model server) | The shared start of the prompt | Safe, and the biggest cost saving |
+| Exact answer cache | Normalized question + index version, **general questions only** | OK for FAQs |
+| "Similar question" cache | Questions that are nearly the same | **Only for approved general answers.** Never for anything that used account data, because a near-match could return another customer's answer |
 
-- **Degradation policy (fail closed on compliance):**
-  - Vector search down → do *not* answer policy questions ungrounded. Say so and offer escalation to a human.
-  - Account API down → answer policy questions, and state that account details are temporarily unavailable.
-  - GPU saturation → admission control, then route to the smaller model, then queue with an honest ETA.
-- **Audit record per turn:** prompt template version, retrieved chunk IDs and versions, tool calls (arguments and redacted results), model and version, and output. Keep it immutable and encrypted, with PII redaction before it reaches general-purpose logs.
-- **Observability:** one trace per turn with spans for retrieval, rerank, tools, prefill and decode. Record token counts, TTFT and TPOT as first-class metrics, plus cost per tenant and per intent.
+- **When things break, be safe on compliance:**
+  - Search is down → do **not** answer policy questions without sources. Say so and offer a human.
+  - The account system is down → still answer policy questions, and say account details are temporarily unavailable.
+  - GPUs are full → limit new requests, switch to the smaller model, or queue with an honest wait time.
+- **Audit record for every answer:** prompt template version, retrieved chunk IDs and versions, tool calls, model and version, and the answer. Store it so it can't be changed and is encrypted, and remove personal data before it reaches general logs.
+- **Monitoring:** one trace per answer, showing the time spent in search, reranking, tools, prefill and decode. Track token counts, time to first token and time per token, plus cost per customer and per question type.
 
-## 2.4 Mermaid: RAG Serving Architecture
+## 2.4 Diagram: RAG Serving Architecture
 
 ```mermaid
 flowchart LR
@@ -467,36 +483,36 @@ flowchart LR
 
 *[Open full-size diagram: RAG serving architecture (SVG)](../diagrams/m2-rag-serving-architecture.svg)*
 
-## 2.5 Animation Blueprint: From Text to Tokens, Vectors, and an HNSW Match
+## 2.5 Animation Plan: From Text to Tokens, Vectors, and an HNSW Match
 
-**Scene setup:** use `ThreeDScene` for the vector-space acts and a plain `Scene` for the tokenizer act. Set `self.set_camera_orientation(phi=70*DEGREES, theta=-45*DEGREES)`. Fix the random seed so the point layout is reproducible.
+**Scene:** use `ThreeDScene` for the 3D parts and a normal `Scene` for the text part. Set the camera angle with `self.set_camera_orientation(phi=70*DEGREES, theta=-45*DEGREES)`. Fix the random seed so the layout is the same every time.
 
-| Time | Act | Visual | Manim primitives / notes |
+| Time | Step | What you see | Manim tools / notes |
 |---|---|---|---|
-| 0:00–0:04 | **1. Input** | The query "Can I dispute a card charge made abroad?" types across the screen | `AddTextLetterByLetter` |
-| 0:04–0:09 | **2. Tokenize** | The sentence splits into rounded "token chips" on sub-word boundaries (e.g. `dis` `pute`). Each chip flips to reveal an integer ID. Caption: *IDs and splits are illustrative and depend on the tokenizer* | `VGroup` of `RoundedRectangle`+`Text`, `Rotate(axis=UP)` flip, then `Transform` to the ID |
-| 0:09–0:15 | **3. Embed** | A tall matrix grid (the embedding table) appears. Each ID highlights its row, and the rows slide out as coloured bars | `Rectangle` grid, `Indicate(row)`, `ReplacementTransform` |
-| 0:15–0:20 | 3 | The bars pass through a stack of translucent transformer blocks. Thin attention lines crisscross between tokens, and the bar colours shift (contextualization) | `Line` with low opacity, `LaggedStart`, colour interpolation |
-| 0:20–0:24 | 3 | Mean pooling: the bars compress into one 1,024-cell heat-strip, the *sentence embedding*. Caption: *an embedding model, not the chat LLM, produces this vector* | `Transform` into a `VGroup` of 1,024 thin rectangles coloured by value |
-| 0:24–0:28 | **4. Normalize** | The strip becomes a 3D arrow from the origin. The arrow snaps its length to touch a translucent unit sphere | `Arrow3D`, `Sphere(opacity=0.1)`, `scale_to_fit` |
-| 0:28–0:35 | **5. Vector space** | Thousands of chunk points fade in, clustered and labelled *Disputes*, *Travel*, *Fees*, *Mortgages*. Caption: *3D UMAP projection. Real space has 1,024 dimensions and distances are distorted here.* The camera begins a slow orbit | `Dot3D` clouds, `begin_ambient_camera_rotation(rate=0.1)` |
-| 0:35–0:38 | 5 | The query point appears as a glowing star between *Disputes* and *Travel* | `Dot3D` with a glow ring, `Flash` |
-| 0:38–0:42 | **6. HNSW layers** | The cloud separates vertically into three translucent planes: L2 (≈10 nodes), L1 (≈100), L0 (all). Vertical dotted lines link a node's copies across layers | `Surface` planes, `DashedLine` |
-| 0:42–0:48 | 6 | **Greedy descent on L2:** start at the entry point and hop edge by edge toward the star. A side panel shows `distance: 0.91 → 0.74 → 0.63`. When no neighbour improves, drop down the dotted line to L1 | `MoveAlongPath`, `DecimalNumber` updating, `Circumscribe` on the local minimum |
-| 0:48–0:54 | 6 | Repeat on L1 with shorter hops. Drop to L0 | Same primitives, faster |
-| 0:54–1:02 | 6 | **Beam search on L0:** a side panel lists the candidate priority queue (`ef_search = 64`, top 8 shown). Nodes light up as they are expanded, and the queue reorders live | `Table`-like `VGroup` re-sorted with `Transform`, highlight via `set_color` |
-| 1:02–1:07 | **7. Rerank** | The top 8 hits pull out into a row with cosine scores. A reranker "lens" passes over them, and they reorder. One lexically similar but irrelevant chunk (*"dispute a parking ticket"*) drops from #2 to #7 | `animate.arrange`, `Indicate` |
-| 1:07–1:12 | **8. Filter failure** (bonus) | Rewind to L0. Apply the filter `jurisdiction = QC`: 98% of nodes grey out. The beam search gets trapped on a disconnected island of matching nodes and returns 2 results instead of 8. Caption: *selective filters fragment the graph* | `set_opacity(0.1)`, red `Cross` on the trapped search |
-| 1:12–1:16 | 8 | Fix: the space splits into per-jurisdiction sub-indexes. The search runs inside the *QC* partition and returns 8 good results | `FadeTransform` to a smaller, dense graph |
-| 1:16–1:20 | **9. Prompt** | The final 5 chunks fly into a prompt template card beside the system prompt. Citation badges `[1]`–`[5]` attach | `ReplacementTransform`, `LaggedStart(FadeIn)` |
+| 0:00–0:04 | **1. Question** | "Can I dispute a card charge made abroad?" types across the screen | `AddTextLetterByLetter` |
+| 0:04–0:09 | **2. Tokens** | The sentence splits into chips, one per token (for example `dis` `pute`). Each chip flips to show a number. Caption: *the exact split and numbers depend on the tokenizer* | Rectangles with text, flip, `Transform` to the number |
+| 0:09–0:15 | **3. Embed** | A tall grid (the embedding table) appears. Each number highlights one row, which slides out as a coloured bar | Grid, `Indicate(row)`, `ReplacementTransform` |
+| 0:15–0:20 | 3 | The bars pass through a stack of see-through blocks (the model's layers). Thin lines cross between tokens, and the colours change as tokens take in context | Faint `Line`s, `LaggedStart`, colour changes |
+| 0:20–0:24 | 3 | The bars merge into one strip of 1,024 colours: the *sentence embedding*. Caption: *an embedding model makes this, not the chat model* | `Transform` into 1,024 thin rectangles |
+| 0:24–0:28 | **4. Normalize** | The strip becomes a 3D arrow from the centre, and the arrow's length snaps to touch a see-through sphere of radius 1 | `Arrow3D`, sphere |
+| 0:28–0:35 | **5. Vector space** | Thousands of chunk dots fade in, in labelled clusters: *Disputes*, *Travel*, *Fees*, *Mortgages*. Caption: *a 3D picture of a 1,024-dimension space, so distances are only rough*. The camera slowly circles | `Dot3D`, ambient camera rotation |
+| 0:35–0:38 | 5 | The question appears as a glowing star between *Disputes* and *Travel* | `Dot3D` with glow, `Flash` |
+| 0:38–0:42 | **6. HNSW layers** | The dots separate into three see-through layers: top (~10 dots), middle (~100) and bottom (all). Dotted vertical lines connect copies of the same dot | Planes, dashed lines |
+| 0:42–0:48 | 6 | **Top layer:** start at the entry point and hop toward the star. A side panel shows the distance shrinking: `0.91 → 0.74 → 0.63`. When no hop helps, drop down a level | `MoveAlongPath`, counting number, `Circumscribe` |
+| 0:48–0:54 | 6 | Same on the middle layer with shorter hops. Drop to the bottom | Same, faster |
+| 0:54–1:02 | 6 | **Bottom layer:** a side panel shows the shortlist (`ef_search = 64`, top 8 shown). Dots light up as they're checked, and the shortlist re-sorts live | Re-sorting list, highlights |
+| 1:02–1:07 | **7. Rerank** | The top 8 line up with scores. A "lens" passes over them and re-orders them. A lookalike chunk (*"dispute a parking ticket"*) falls from #2 to #7 | `animate.arrange`, `Indicate` |
+| 1:07–1:12 | **8. Filter problem** (bonus) | Back to the bottom layer. Apply the filter `country = QC`: 98% of dots turn grey. The search gets stuck on an island and finds only 2 results instead of 8. Caption: *strict filters break the graph* | Fade out, red cross |
+| 1:12–1:16 | 8 | Fix: split into separate indexes per country. Searching the *QC* index finds 8 good results | `FadeTransform` to a smaller graph |
+| 1:16–1:20 | **9. Prompt** | The final 5 chunks fly into a prompt card beside the system prompt, and citation tags `[1]`–`[5]` attach | `ReplacementTransform`, `LaggedStart` |
 
-## 2.6 Staff-level Review Questions
+## 2.6 Review Questions
 
-- What is the recall@10 of the retriever on the golden set, and how much of the quality gap is retrieval rather than generation?
-- How do you guarantee that superseded policy text can no longer be retrieved, and how quickly after publication?
-- Which cache layers could ever return data derived from another customer's account, and what proves they can't?
-- What are the TTFT and TPOT SLOs, and at what batch size does TPOT breach them?
-- When the GPU pool is saturated, which users get degraded first, and is that a product decision or an accident?
+- How often does search find the right chunk in the top 10 on your test questions, and how much of the quality problem is search rather than the AI?
+- How do you make sure an old policy version can no longer be found, and how soon after the new one is published?
+- Could any cache ever return data from another customer's account? What proves it can't?
+- What are your targets for time to first token and time per token, and at what batch size do you miss them?
+- When the GPUs are full, which users get slower service first? Is that a product decision or an accident?
 
 ---
 

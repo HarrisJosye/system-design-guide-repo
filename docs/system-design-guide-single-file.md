@@ -1,6 +1,6 @@
 # The Definitive Guide to Modern System Design & Architecture
 
-**From Senior to Staff/Principal: hard trade-offs, reference architectures, and teaching blueprints**
+**A plain-language guide to how large systems are built, why they break, and how to fix them**
 
 ---
 
@@ -8,34 +8,84 @@
 
 ## How to read this guide
 
-**Start with Module 0**, which covers the six recurring scaling concerns: scale reads, scale writes, split reads and writes, real-time data, reliability and long-running jobs. Modules 1–6 then apply them under industry-specific pressure. Each major concept has a simple block diagram at the top of its section.
+This guide explains how big software systems work: banking systems, AI chatbots, IoT platforms and SaaS products. It is written so that a junior developer can follow it, but it doesn't skip the hard parts. When a technical word appears for the first time, it is explained in plain words. The glossary below collects the most common ones.
 
-Each module follows the same structure: **Theory & Trade-offs → Python in Practice → Case Study (with capacity math) → Mermaid Architecture → Animation Blueprint → Staff-level Review Questions.**
+**Start with Module 0.** It covers six problems that come up in almost every large system: handling lots of reads, handling lots of writes, keeping reads and writes apart, delivering data in real time, staying reliable, and running long jobs. Modules 1–6 then show those same ideas in real industries.
 
-Numbers are order-of-magnitude assumptions used to show *how* to reason. They are not benchmarks. Always measure your own hardware, data and access patterns. Cloud mappings use Azure first, with AWS/GCP equivalents where it helps.
+Every module has the same parts:
 
-Three ideas come up in every module. Keep them in mind as the thread that ties the guide together:
+1. **Ideas and trade-offs.** What the concept is, and what you give up to get it.
+2. **Python code.** Short, working examples.
+3. **Case study.** A realistic system with rough numbers.
+4. **Diagrams.** A simple block diagram at the start of each concept, plus bigger architecture diagrams. Click any diagram on the website to open it full screen and zoom in.
+5. **Animation plan.** A step-by-step description of how you could animate the idea, for teaching.
+6. **Review questions.** Questions a senior engineer would ask in a design review.
 
-1. **Correctness lives in the storage layer, not in coordination services.** Locks, caches and leader leases are optimizations. Constraints, conditional writes and monotonic version numbers are guarantees.
-2. **Every network hop is at-least-once.** "Exactly-once" is at-least-once delivery plus an idempotent side effect, committed atomically with a dedupe record.
-3. **Monotonic numbers beat wall clocks.** Fencing tokens (Module 1), Raft terms and device-ownership epochs (Module 3), and page LSNs and directory epochs (Module 4) are the same idea. A higher number wins, and a stale actor gets rejected by the thing it tries to write to.
+**About the numbers:** they are rough estimates, used to show *how* to reason about size and speed. They are not benchmarks. Always measure your own system. Cloud examples use Azure first, with AWS or GCP names where it helps.
+
+**Three ideas appear again and again.** If you remember only three things, remember these:
+
+1. **The database is the final judge.** Locks and caches make things faster, but they can fail. Rules enforced by the database, such as "only update this row if the version is still 7", are what actually keep data correct.
+2. **Messages can arrive twice.** Networks retry. So every action that can be repeated must be safe to repeat. This property is called *idempotency*.
+3. **Counters beat clocks.** Clocks on different machines disagree. A number that only goes up (a version, a term, an epoch) is a safer way to tell old from new: the higher number wins, and the older actor gets rejected.
+
+## Glossary: words you'll see often
+
+| Word | Plain meaning |
+|---|---|
+| **Latency** | How long one request takes, for example 50 ms |
+| **Throughput** | How many requests the system handles per second |
+| **p99 (99th percentile)** | The time within which 99 out of 100 requests finish. It shows how the slowest requests behave, not just the average |
+| **TPS / RPS** | Transactions per second / requests per second |
+| **Node** | One machine, virtual machine or container in a system |
+| **Replica** | A copy of data kept on another node |
+| **Primary** | The one copy that accepts writes. Replicas copy from it |
+| **Shard / partition** | One slice of a big dataset. Each slice lives on different machines, so the work is split |
+| **Cache** | A fast, temporary copy of data (often in memory, such as Redis) to avoid asking the slower database |
+| **Queue / log** | A durable list of messages waiting to be processed. Kafka and Azure Event Hubs are common examples |
+| **Idempotent** | Safe to repeat. Doing it twice has the same effect as doing it once |
+| **Transaction** | A group of database changes that all succeed together or all fail together |
+| **ACID** | The four promises a transaction makes: all-or-nothing, rules kept, no interference from others, and saved permanently |
+| **Consistency (strong)** | Everyone sees the latest data right away |
+| **Eventual consistency** | Copies may be briefly out of date but catch up soon |
+| **Stale data** | An old copy that hasn't caught up yet |
+| **Replication lag** | How far behind a replica is |
+| **Throttling / rate limit** | Deliberately limiting how many requests a client can make |
+| **Backpressure** | Slowing down the sender when the receiver can't keep up, instead of piling up work |
+| **Timeout** | Giving up on a call after a set time, so you don't wait forever |
+| **Retry with backoff and jitter** | Trying again after a failure, waiting a little longer each time, plus a small random delay so clients don't all retry at the same moment |
+| **Circuit breaker** | A switch that stops calling a failing service for a while, so it can recover |
+| **SLO** | A reliability target, for example "99.95% of requests succeed within 300 ms" |
+| **RPO / RTO** | How much data you can afford to lose (RPO) and how long recovery may take (RTO) |
+| **CDC (change data capture)** | Reading the database's own change log to publish every change as an event |
+| **Outbox** | A table where you save "events to send" inside the same transaction as your data change, so sending can't be forgotten |
+| **Event** | A record that something happened, for example "FundsDebited" |
+| **Consensus** | A way for several machines to agree on one answer even if some of them fail. Raft is the best-known method |
+| **Quorum / majority** | More than half the machines. Most agreement methods need a majority |
+| **Split brain** | Two parts of a system both think they're in charge, and both make changes |
+| **Fencing token** | A number that only goes up. It is attached to writes so the database can reject writes from an old owner |
+| **Embedding / vector** | A list of numbers that represents the meaning of text, so similar texts have similar numbers |
+| **LLM** | Large language model, the kind of AI that generates text |
+| **Token (LLM)** | A small piece of text (part of a word) that an LLM reads or writes |
+| **WAL (write-ahead log)** | A file where the database writes every change *before* updating its main data, so it can recover after a crash |
+| **Tenant** | One customer organization in a shared (multi-tenant) system |
 
 ---
 
 # Module 0 — Core Building Blocks: The Six Scaling Concerns
 
-*Cross-industry foundations used by every later module*
+*Foundations used in every other module*
 
-Most system design problems reduce to six recurring concerns. This module treats each one on its own, with techniques, trade-offs, Python and a block diagram. Modules 1–6 then apply them under industry-specific pressure.
+Most system design problems come down to six questions. This module answers each one with the main techniques, what they cost, some Python, and a diagram. The later modules reuse these ideas in real industries.
 
-| Concern | The core question | Primary techniques | Deeper in |
+| Concern | The question it answers | Main techniques | See also |
 |---|---|---|---|
-| **Scale reads** | How do we serve 10–1,000× more reads than writes without melting the database? | Indexes, caching layers, replicas, denormalized read models | M1 (CQRS), M2 (caching), M4 (replicas) |
-| **Scale writes** | How do we absorb more writes than one node can durably commit? | Batching, queues for load leveling, partitioning, write-optimized storage | M1 (ledger shards), M3 (IoT ingest), M4 (sharding, WAL) |
-| **Split reads and writes** | How do reads and writes scale independently without users seeing stale or wrong data? | Replica routing, CQRS, consistency tokens, staleness budgets | M1 (CQRS), M4 (routing) |
-| **Real-time data** | How do changes reach users and systems within milliseconds to seconds? | CDC and events, push channels, pub/sub fan-out, snapshot + delta | M2 (SSE), M5 (stream processing) |
-| **Reliability** | How does the system keep its promises when parts of it fail? | SLOs, redundancy, timeouts, retries, breakers, DR, safe deploys | M3 (resiliency), M4 (replication) |
-| **Long-running jobs** | How does work that takes minutes to hours survive crashes, deploys and retries? | Async request–reply, leases and heartbeats, checkpoints, durable workflows | M6 (batch parallel run) |
+| **Scale reads** | How do we serve far more reads than writes without overloading the database? | Better queries, caches, replicas, precomputed read tables | M1, M2, M4 |
+| **Scale writes** | How do we save more writes than one database machine can handle? | Batching, queues, splitting data across machines | M1, M3, M4 |
+| **Split reads and writes** | How do reads and writes grow separately without users seeing wrong data? | Replicas, separate read models, "freshness" rules per page | M1, M4 |
+| **Real-time data** | How do changes reach users within seconds or less? | Change events, WebSockets/SSE, pub/sub | M2, M5 |
+| **Reliability** | How does the system keep working when parts break? | Targets (SLOs), spare copies, timeouts, retries, backups | M3, M4 |
+| **Long-running jobs** | How does work that takes minutes or hours survive crashes and restarts? | Job queues, leases, heartbeats, checkpoints | M6 |
 
 ```mermaid
 flowchart LR
@@ -77,52 +127,53 @@ flowchart LR
 
 *[Open full-size diagram: The read-scaling ladder, cheapest rung first (SVG)](diagrams/m0-the-read-scaling-ladder-cheapest-rung-first.svg)*
 
-### Theory & trade-offs
+### The idea
 
-Reads usually dominate, at 10:1 to 1,000:1 over writes. They are also *easier* to scale than writes, because a read can be served from a copy. **The whole discipline is deciding how stale each copy may be.** Climb the ladder from the bottom and stop as soon as the numbers work, because every rung adds staleness and operational cost.
+Most systems get far more reads than writes: often 10 to 1,000 times more. Reads are the easier side to scale, because a read can be answered from a **copy** of the data. The real question is always: **how old is that copy allowed to be?**
 
-1. **Fix the queries first.** A covering index, removing an N+1 pattern, or paginating by keyset instead of `OFFSET` routinely buys 10–100× before any architecture changes.
-2. **Cache in layers:**
-   - the browser or client (HTTP `Cache-Control`, `ETag`);
-   - a **CDN** for static assets and cacheable API responses;
-   - a **distributed cache** (Redis);
-   - an **in-process cache** (an LRU with a sub-second to seconds TTL, for the hottest keys);
-   - the database's own buffer pool.
-3. **Read replicas** add read capacity linearly, with replication lag as the price.
-4. **Denormalized read models** (CQRS projections, materialized views) precompute the answer so that a read becomes a single key lookup.
-5. **Specialized stores** each answer a query shape the OLTP database is bad at: search engines for text, columnar warehouses for analytics, vector indexes for similarity.
-6. **Partitioning** is the last rung, used when the dataset itself no longer fits one node's memory and I/O.
+Work up the ladder from the cheapest step, and stop as soon as it's fast enough. Each step up adds cost and makes data a little more out of date.
 
-**Hit-ratio arithmetic is non-linear.** Database load is `total × (1 − hit ratio)`. Going from a 90% to a 99% hit ratio cuts database load **10×**, while going from 50% to 90% cuts it only 5×. The last few percent of hit ratio are where the money is, and they usually come from better key design, longer TTLs on immutable data, and caching negative results.
+1. **Fix the queries.** Add the right index, remove N+1 queries (one query per row in a loop), and page with "WHERE id > last_id" instead of `OFFSET`. This alone often makes things 10 to 100 times faster.
+2. **Add caches, in layers:**
+   - the browser (HTTP caching headers);
+   - a **CDN** (servers close to users that store copies of pages and files);
+   - a shared cache such as **Redis**;
+   - a small in-memory cache inside each app process for the very hottest data.
+3. **Add read replicas.** These are copies of the database that only serve reads. Each one adds read capacity, but it lags a little behind the primary.
+4. **Build read models.** Tables or views where the answer is already computed, so a page loads with a single lookup instead of a join across many tables.
+5. **Use a specialized store** for query types the main database is bad at: a search engine for text, a data warehouse for reports, a vector index for "find similar meaning".
+6. **Split the data across machines (sharding)**, but only when the data itself no longer fits on one machine.
+
+**Cache hit ratio matters more than it looks.** The database only sees the cache misses: `database load = total reads × (1 − hit ratio)`. At a 90% hit ratio the database gets 10% of reads. At 99% it gets 1%, which is **10 times less load**. Small gains near the top make a big difference.
 
 ### Caching patterns
 
-| Pattern | How it works | Strength | Weakness |
+| Pattern | How it works | Good | Bad |
 |---|---|---|---|
-| **Cache-aside** | The app reads the cache. On a miss it reads the DB, then populates the cache | Simple. The cache holds only what's used | Race conditions on invalidation. The first read after expiry is slow |
-| **Read-through** | The cache library loads from the DB on a miss | Loading logic lives in one place | Needs cache-side integration |
-| **Write-through** | Writes go to the cache and the DB synchronously | The cache is always warm and fresh | Every write pays cache latency. Caches data nobody reads |
-| **Write-behind** | Writes go to the cache, and the DB is updated asynchronously | Very fast writes | Data loss if the cache dies before the flush. **Almost never acceptable for money** |
-| **Refresh-ahead** | Hot keys are refreshed before they expire | No latency spike on expiry | Wasted refreshes on keys that went cold |
+| **Cache-aside** (most common) | The app checks the cache. On a miss it reads the database and saves the result in the cache | Simple. Only caches data that's actually used | The first read after expiry is slow. Easy to get cache clearing wrong |
+| **Read-through** | The cache itself loads from the database on a miss | Loading logic is in one place | Needs a cache library that supports it |
+| **Write-through** | Every write updates the cache and the database together | The cache is always fresh | Every write is slower. Caches data nobody reads |
+| **Write-behind** | Writes go to the cache first, and the database is updated later | Very fast writes | Data is lost if the cache crashes first. **Never use for money** |
+| **Refresh-ahead** | Refresh popular items before they expire | No slow first read | Wasted work refreshing items nobody wants anymore |
 
-**Invalidation.** Use TTL for everything, plus explicit invalidation for data that must not be stale:
+**Keeping the cache correct (invalidation):**
 
-- On write, **delete** the key. Don't set it: two concurrent writers can otherwise leave the older value in the cache.
-- Classic cache-aside still has a race: a reader loads the old row, a writer updates the DB and deletes the key, and *then* the reader writes the stale value it loaded. Mitigations include short TTLs, versioned values (write only if the version is newer), a second delayed delete, or **leases** (the cache hands a token to the first misser and rejects sets carrying stale tokens, as Facebook's memcache paper describes).
-- **CDC-driven invalidation** consumes the database's change stream and deletes affected keys, so invalidation cannot be forgotten by a code path.
+- Give every cached item a **TTL** (time to live), so it expires automatically.
+- When data changes, **delete** the cache entry. Don't overwrite it, because two writers could leave the older value behind.
+- There is still a small race condition: a reader loads the old row, a writer changes the database and deletes the cache entry, and then the reader saves its old copy into the cache. Fixes include short TTLs, storing a version number with the value, deleting the entry a second time a moment later, or "leases", where only the first request after a miss is allowed to fill the cache.
+- A robust option is to clear cache entries from the **database's change stream (CDC)**. That way no code path can forget to do it.
 
-**Failure modes you must design for:**
+**Common cache problems to design for:**
 
-- **Cache stampede.** A hot key expires, and 5,000 concurrent requests all miss and hit the database at once. Fixes:
-  - **single-flight** (request coalescing): one loader per key, and everyone else awaits it;
-  - **stale-while-revalidate**: serve the stale value while one request refreshes;
-  - **jittered TTLs**, so keys cached together don't expire together;
-  - probabilistic early refresh.
-- **Hot keys.** One key receives a large share of traffic (a celebrity profile, today's rates table) and saturates one cache shard. Fixes: an in-process tier in front, replicating the key across shards (`key#0..key#7`, choosing one at random), or pushing it to the CDN.
-- **Cold start.** A cache flush or new cluster sends 100% of reads to the database. Capacity-plan the database for a *degraded hit ratio*, warm caches before shifting traffic, and shed load if needed.
-- **The cache becomes a hard dependency.** Decide explicitly what happens when Redis is down: serve from the database with shedding, or fail fast.
+- **Cache stampede.** A popular item expires and thousands of requests all miss at once and hit the database together. Fixes:
+  - **request coalescing ("single-flight")**: only one request loads the value while the rest wait for it;
+  - **serve stale while refreshing**: return the old value while one request fetches the new one;
+  - **add randomness to TTLs** so items don't all expire at the same moment.
+- **Hot keys.** One item gets so much traffic that it overloads one cache server. Fixes: keep a copy in each app's local memory, spread copies across several cache keys, or put it on the CDN.
+- **Cold cache.** After a restart, the cache is empty and every read hits the database. Make sure the database can survive a low hit ratio, warm the cache up first, and turn away extra load if needed.
+- **The cache goes down.** Decide ahead of time what happens: read from the database with limits, or fail fast.
 
-### Python: cache-aside with single-flight, stale-while-revalidate and jitter
+### Python: a cache with request coalescing, stale-while-refresh and random TTLs
 
 ```python
 import asyncio
@@ -175,7 +226,7 @@ async def _load(key: str, loader: Callable[[], Awaitable[dict]],
         _inflight.pop(key, None)
 ```
 
-Single-flight here is **per process**. With 200 pods, a stampede becomes at most 200 loads instead of 5,000, which is usually enough. For truly expensive loaders, add a short Redis `SET NX` lease so only one process fleet-wide recomputes, while the others keep serving stale values.
+"Single-flight" here works **per app process**. With 200 app servers, a stampede becomes at most 200 database loads instead of thousands, which is usually fine. For very expensive loads, add a short Redis lock so only one server in the whole fleet refreshes the value while the rest keep serving the old one.
 
 ## 0.2 Scale Writes
 
@@ -197,31 +248,33 @@ flowchart LR
 
 *[Open full-size diagram: Write-scaling path, from request to durable storage (SVG)](diagrams/m0-write-scaling-path-from-request-to-durable-storage.svg)*
 
-### Theory & trade-offs
+### The idea
 
-Writes are harder than reads for three reasons. They must be **durable** (an fsync, a replica ack), they must be **ordered** for the same entity, and they **cannot be served from a copy**. Every technique below either makes a single write cheaper, groups writes together, or spreads them across more independent writers.
+Writes are harder to scale than reads, for three reasons:
 
-| Technique | What it buys | What it costs |
+- they must be **saved safely** (written to disk and usually copied to a replica);
+- writes to the same thing (like one bank account) often must happen **in order**;
+- they **can't be answered from a copy**.
+
+Every technique below does one of three things: it makes each write cheaper, groups many writes together, or spreads writes across more machines.
+
+| Technique | What you gain | What you give up |
 |---|---|---|
-| **Cheaper writes** (fewer indexes, append instead of update-in-place, bulk `COPY`) | 2–10× on the same hardware | Slower reads for dropped indexes |
-| **Batching and group commit** | Amortizes fsyncs and network round trips across many writes | Adds up to the batch window in latency |
-| **Queue-based load leveling** (accept, enqueue, return `202`) | Absorbs spikes. The database runs at a steady rate | Asynchronous results. You need idempotency and a status API |
-| **Partitioning** by entity key | The only way to scale one logical write stream horizontally | Cross-partition operations become sagas. Hot keys still hurt |
-| **Write-optimized storage** (LSM trees such as Cassandra, ScyllaDB and RocksDB, or time-series DBs) | Sequential disk writes, very high ingest | Read amplification and compaction tuning |
-| **Contention removal** (commutative appends, sharded counters) | Removes the row-lock bottleneck on hot entities | Reads must merge the pieces |
-| **Mergeable data types** (CRDTs) | Multi-region writes without coordination | Only for data with natural merge semantics |
+| **Cheaper writes** (fewer indexes, append new rows instead of updating, bulk `COPY`) | 2–10× faster on the same hardware | Some reads get slower without those indexes |
+| **Batching** (save many writes in one go) | Far fewer disk syncs and round trips | Each write waits a few milliseconds for its batch |
+| **Queue in front** (accept the request, reply "202 Accepted", process it later) | Traffic spikes are absorbed and the database works at a steady pace | The result isn't immediate. You need a way to report status, and safe retries |
+| **Split data by key (sharding)** | Many machines accept writes at once | Operations across two shards get harder |
+| **Write-optimized databases** (Cassandra, ScyllaDB, time-series databases) | Very high write rates | Reads and maintenance are harder |
+| **Avoid fighting over one row** (append instead of update, split one counter into several) | No lock queue on busy rows | Reads must add the pieces together |
+| **Mergeable data types (CRDTs)** | Writes in several regions without coordination | Only works for data that merges naturally, such as counters and sets |
 
-**Ordering is the hidden scalability limit.** A single global order doesn't scale, because one sequencer eventually saturates. *Per-key* order does scale. Decide which entities need ordering (an account's postings, a device's configuration) and partition by exactly that key. Everything else can be unordered.
+**Ordering limits scaling.** If *everything* must be in one global order, one machine ends up doing the ordering, and it becomes the bottleneck. Usually only writes to the *same thing* need ordering, such as one account's transactions or one device's settings. So split the data by that key, and let everything else run in parallel.
 
-**Hot partitions.** A skewed key (a marketplace merchant, a viral post, a single noisy tenant) concentrates writes on one partition however many you have. Options:
+**Hot partitions.** If one key is extremely busy (a huge merchant, a viral post, one big customer), it overloads its shard however many shards you have. Fixes: split the key into sub-keys (`merchant-42#0` to `#15`) and add them up when reading, append changes and combine them in batches, or give that key its own machine.
 
-- **Key salting:** write to `merchant-42#0..#15` and merge on read.
-- **Commutative appends** that are folded in batches.
-- **Dedicated capacity** for known-huge keys.
+**A queue is a buffer, not extra capacity.** If messages arrive faster than you process them for long enough, the queue grows forever. Set a target such as "messages wait less than 30 seconds", add workers based on how long messages have been waiting (not on CPU), and turn requests away when the queue is too far behind.
 
-**Queues are buffers, not capacity.** Little's Law applies: if arrivals exceed the service rate for long enough, the backlog grows without bound. Set a **maximum queue-age SLO** (for example, "p99 message age under 30 s"), autoscale consumers on queue age rather than CPU, and shed or reject at the edge when the backlog breaches the limit.
-
-### Python: an async micro-batcher with per-item completion
+### Python: an async micro-batcher
 
 ```python
 import asyncio
@@ -274,7 +327,7 @@ async def flush_events(rows: list[tuple]) -> None:
             "ON CONFLICT (event_id) DO NOTHING", rows)
 ```
 
-The trade-off is explicit and tunable: `max_wait_s=0.010` adds up to 10 ms of latency per write and can raise throughput by an order of magnitude, because one round trip and one commit now cover up to 500 rows.
+The trade-off is easy to tune. Waiting up to 10 ms adds a little delay to each write, but one database round trip and one commit now save up to 500 rows. That can mean 10 times more writes per second.
 
 ## 0.3 Split Reads and Writes
 
@@ -299,41 +352,41 @@ flowchart LR
 
 *[Open full-size diagram: Separating the read path from the write path (SVG)](diagrams/m0-separating-the-read-path-from-the-write-path.svg)*
 
-### Theory & trade-offs
+### The idea
 
-Splitting reads from writes lets each side scale, be optimized, and even use different technology independently. It exists on a spectrum, and each level buys more read scale in exchange for more staleness and more moving parts:
+If reads and writes use separate paths, each side can grow and be optimized on its own, even with different databases. There are several levels. Each level gives you more read capacity, but data gets more out of date and there are more parts to run.
 
-| Level | Separation | Read staleness | Complexity |
+| Level | What's separated | How stale reads can be | Complexity |
 |---|---|---|---|
-| **L1** | Same database, separate command and query code paths | None | Low |
-| **L2** | Primary for writes, **replicas** for reads | Replication lag (ms to s, occasionally minutes) | Medium |
-| **L3** | **CQRS**: read models built from events or CDC | Projection lag | High |
-| **L4** | Several read stores per query shape (search, cache, warehouse) | Varies per store | Highest |
+| **L1** | Same database, but separate code for reads and writes | Not stale | Low |
+| **L2** | Writes go to the primary, reads go to **replicas** | A little: milliseconds to seconds, sometimes minutes | Medium |
+| **L3** | **CQRS**: separate read tables, built from change events | The time it takes to update the read tables | High |
+| **L4** | Several read stores for different needs (search, cache, warehouse) | Different for each store | Highest |
 
-**The anomalies you create, and their fixes:**
+**Problems this causes, and how to fix them:**
 
-| Anomaly | Example | Fix |
+| Problem | Example | Fix |
 |---|---|---|
-| **Read-your-writes** | The user saves a profile, refreshes, and sees the old one | Return a **consistency token** (commit LSN or version) from the write, and read from a replica only once it has replayed past the token. Otherwise read from the primary |
-| **Monotonic reads** | Two refreshes hit different replicas, and the data appears to go back in time | Pin the session to one replica, or carry the highest token seen |
-| **Causal consistency** | A reply is visible before the message it answers | Carry tokens across services, or read both from the same source |
+| **Not seeing your own write** | You save your profile, refresh, and see the old version | After the write, give the client a **token** (the database's log position or a version). Only read from a replica that has caught up to that token, otherwise read from the primary |
+| **Going back in time** | Two refreshes hit different replicas, and newer data seems to disappear | Keep a user on one replica, or remember the newest token they've seen |
+| **Effects before causes** | A reply shows up before the message it answers | Carry tokens between services, or read both items from the same place |
 
-**Decide a staleness budget per endpoint**, and write it down. It turns a vague architecture debate into a routing table:
+**Write down a "freshness budget" for every page or API.** It turns a vague debate into a simple routing table:
 
-| Read | Staleness budget | Route |
+| Read | How stale it may be | Where to read |
 |---|---|---|
-| Balance used to authorize a payment | 0 | Primary only |
-| Balance shown right after the user's own transfer | Read-your-writes | Replica if caught up to the token, else primary |
-| Transaction history page | ≤ 5 s | Replica |
-| Monthly spending insights | ≤ 1 h | Warehouse / read model |
+| Balance used to approve a payment | Must be current | Primary only |
+| Balance shown right after your own transfer | Must include your own write | Replica if caught up, else primary |
+| Transaction history page | Up to 5 seconds old | Replica |
+| Monthly spending chart | Up to 1 hour old | Warehouse or read model |
 
-**Where to route:**
+**Where the routing decision can happen:**
 
-- **In the application** (SQLAlchemy `get_bind`, Django routers; see Module 4). This is the most control, and the only place that knows staleness budgets.
-- **In the driver.** PostgreSQL's libpq accepts multi-host connection strings with `target_session_attrs` values such as `read-write`, `standby` and `prefer-standby` (PostgreSQL 14+). This is good for failover, but blind to per-request budgets.
-- **In a proxy** (Pgpool-II for PostgreSQL, ProxySQL for MySQL). Transparent, but the proxy can't know which reads tolerate lag.
+- **In the app code** (SQLAlchemy `get_bind`, Django database routers; see Module 4). You have the most control, and it's the only place that knows each page's freshness budget.
+- **In the database driver.** PostgreSQL's libpq can take several hosts and a `target_session_attrs` setting such as `read-write` or `prefer-standby` (PostgreSQL 14+). Great for failover, but it can't tell which reads are allowed to be stale.
+- **In a proxy** (Pgpool-II for PostgreSQL, ProxySQL for MySQL). Invisible to the app, but it can't know which reads may be stale either.
 
-### Python: read-your-writes routing with LSN consistency tokens
+### Python: read-your-own-writes using database log positions
 
 ```python
 import asyncio
@@ -387,7 +440,7 @@ async def read_with_token(primary: asyncpg.Pool, replicas: dict[str, asyncpg.Poo
     return await pool.fetch(sql, *args)
 ```
 
-The client stores the token (in a cookie or header) for a short window after its own write and echoes it on reads. Everyone else reads from replicas with no token.
+The client keeps the token (in a cookie or header) for a short time after its own write and sends it with reads. Everyone else reads from replicas without a token.
 
 ## 0.4 Real-Time Data
 
@@ -411,35 +464,35 @@ flowchart LR
 
 *[Open full-size diagram: Real-time delivery - capture, fan out, push, resync (SVG)](diagrams/m0-real-time-delivery-capture-fan-out-push-resync.svg)*
 
-### Theory & trade-offs
+### The idea
 
 Real-time data has two halves:
 
-1. **Capturing changes** the moment they happen: an outbox table or CDC from the database (Module 1), and domain events.
-2. **Delivering them** to people and systems with low latency, over push channels.
+1. **Noticing changes** the moment they happen, using an outbox table or CDC (see Module 1) and events.
+2. **Delivering** those changes to users and other systems quickly, using "push" channels.
 
-Real-time *analytics* (computing over streams, as in Module 5's fraud features) is a third, separate concern.
+Analysing data as it flows (like fraud detection in Module 5) is a separate topic.
 
-**Delivery channel options:**
+**Ways to deliver updates:**
 
-| Channel | Direction | Latency | Strengths | Weaknesses |
+| Method | Direction | Delay | Good | Bad |
 |---|---|---|---|---|
-| Short polling | Client pulls | Poll interval | Trivial, cache-friendly | Wasted requests. Latency equals the interval |
-| Long polling | Client pulls, server holds | Low | Works everywhere | Connection churn |
-| **SSE** | Server → client | Low | Plain HTTP, built-in resume via `Last-Event-ID` | One direction. Browsers limit connections on HTTP/1.1 |
-| **WebSocket** | Bidirectional | Lowest | Interactive, binary | Stateful connections, harder behind proxies |
-| Webhooks | Server → server | Low | Standard for partner integrations | Receiver availability, retries, signature verification |
-| Mobile push (APNs/FCM) | Server → device | Seconds, best-effort | Reaches closed apps | No delivery guarantee. Payload limits |
+| Short polling (ask every few seconds) | Client asks | As long as the interval | Very simple | Many wasted requests |
+| Long polling (server holds the request open until there's news) | Client asks | Low | Works everywhere | Constant reconnecting |
+| **SSE (Server-Sent Events)** | Server → client | Low | Plain HTTP. Can resume where it left off | One direction only |
+| **WebSocket** | Both directions | Lowest | Interactive, supports binary data | Keeps a connection open per user. Harder through proxies |
+| Webhooks | Server → another server | Low | Standard way to notify partner systems | The receiver must be up. Needs retries and signature checks |
+| Mobile push (APNs, FCM) | Server → phone | Seconds, best effort | Reaches apps that are closed | Delivery isn't guaranteed. Small payloads only |
 
-**Principles that separate robust real-time systems from demos:**
+**Rules that make real-time systems robust:**
 
-- **The push channel is an optimization. The API is the truth.** Messages *will* be lost (a phone switching networks, a gateway restart). Every channel therefore needs **sequence numbers**. On reconnect, the client sends its last sequence number. The server either **replays** from a short buffer, or tells the client to **resync** by fetching a snapshot from the REST API and resubscribing. This is the **snapshot + delta** pattern.
-- **Fan-out is its own tier.** Connection-holding gateways are stateful, so keep them thin. A pub/sub backplane routes each event only to the gateways that hold the relevant connections. Managed options such as Azure Web PubSub or SignalR Service take this tier off your hands.
-- **Fan-out on write vs. on read.** For feeds, pushing each event into every follower's inbox (on write) is fast to read but expensive for accounts with millions of followers. Pulling at read time is the reverse. Hybrid designs push for normal users and pull for the huge ones.
-- **Slow consumers:** use bounded per-connection buffers. Disconnect clients that can't keep up rather than buffering forever. For market data and dashboards, **conflate**: send only the latest value per key and drop intermediate ticks.
-- **Critical notifications need a durable path.** WebSocket delivery is effectively at-most-once. For "your card was declined", also write to a durable inbox, and push a hint that says "go fetch".
+- **The push channel is a shortcut. The API is the truth.** Messages *will* get lost, for example when a phone switches networks or a server restarts. So number every message. When a client reconnects, it sends the last number it saw. The server either **replays** what was missed, or tells the client to **reload a fresh snapshot** from the normal API. This is called the **snapshot + updates** pattern.
+- **Keep the connection servers thin.** The servers that hold open connections should do little else. A pub/sub system (Redis, NATS, or managed services such as Azure Web PubSub) sends each event only to the servers that hold the right users' connections.
+- **Push on write vs. pull on read.** For feeds, copying each post into every follower's inbox makes reading fast, but it's expensive for accounts with millions of followers. Many systems push for normal accounts and pull for huge ones.
+- **Slow clients:** give each connection a small, limited buffer, and disconnect clients that can't keep up. For live prices or dashboards, send only the **latest** value and skip the in-between ones.
+- **Important alerts need a second path.** A WebSocket message may be lost. For "your card was declined", also save the message to an inbox in the database, and use the push only as a hint to go check it.
 
-### Python: WebSocket feed with replay, resync and heartbeats (Redis Streams)
+### Python: a WebSocket feed that replays, reloads and sends heartbeats (Redis Streams)
 
 ```python
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -482,7 +535,7 @@ async def account_feed(ws: WebSocket, account_id: str, last_id: str | None = Non
         return
 ```
 
-**The scaling caveat, stated plainly:** one blocking `XREAD` per connection means one Redis connection per user, which is fine for thousands of users and wrong for hundreds of thousands. At scale, each gateway process subscribes *once* per channel (or per shard of channels) through a backplane, keeps a local registry of connection → channels, and fans out in memory. The replay and resync protocol stays exactly the same.
+**Important limit:** this example keeps one blocking Redis read per connected user. That's fine for thousands of users but wrong for hundreds of thousands. At that scale, each server process subscribes *once* to each channel, keeps its own list of which connections want which channel, and forwards messages in memory. The replay and reload rules stay the same.
 
 ## 0.5 Reliability
 
@@ -514,60 +567,60 @@ flowchart TB
 
 *[Open full-size diagram: Reliability layers, from process to region (SVG)](diagrams/m0-reliability-layers-from-process-to-region.svg)*
 
-### Theory & trade-offs
+### The idea
 
-Reliability means the system does what it promises, **measured from the user's point of view**. Precise vocabulary:
+Reliability means the system does what it promises, **as seen by users**. Some useful terms:
 
-- **SLI:** a measured indicator, such as the fraction of balance requests served successfully in under 300 ms.
-- **SLO:** the target for that indicator (99.95% over 28 days).
-- **SLA:** the contractual promise, set looser than the SLO.
-- **Error budget:** `1 − SLO`. A 99.95% SLO allows ~21.9 minutes of failure per month. When the budget is spent, releases slow down. When it's healthy, the team can move faster.
-- **RPO / RTO:** how much data you may lose, and how long recovery may take, per failure scenario.
+- **SLI:** something you measure, for example "the share of balance requests answered successfully within 300 ms".
+- **SLO:** the target for it, for example "99.95% over 28 days".
+- **SLA:** a promise in a contract. It is set a bit lower than the SLO, to leave a safety margin.
+- **Error budget:** the failures your SLO allows. A 99.95% target allows about 22 minutes of failure per month. If you use it up, slow down releases. If you have plenty left, you can move faster.
+- **RPO / RTO:** how much data you may lose, and how long recovery may take.
 
-| Availability | Downtime per 30 days |
+| Availability | Downtime allowed per 30 days |
 |---|---|
-| 99% | 7.2 h |
-| 99.9% | 43.2 min |
-| 99.95% | 21.6 min |
-| 99.99% | 4.3 min |
+| 99% | 7.2 hours |
+| 99.9% | 43 minutes |
+| 99.95% | 22 minutes |
+| 99.99% | 4.3 minutes |
 
-**Availability math:**
+**Reliability maths:**
 
-- **Serial dependencies multiply.** Five required dependencies at 99.9% each give at most 0.999⁵ ≈ **99.5%**.
-- **Redundancy multiplies failure probabilities**, *if failures are independent*. Two independent 99% replicas give 1 − 0.01² = 99.99%.
-- **Failures are rarely independent**: shared deploys, shared configuration, shared regions, shared bugs. Correlated failure is why redundancy alone disappoints.
+- **Things you depend on multiply together.** If your service needs five other services and each is up 99.9% of the time, your service is up at most 0.999⁵ ≈ **99.5%**.
+- **Spare copies help**, if they fail independently. Two copies that are each up 99% give 1 − 0.01 × 0.01 = 99.99%.
+- **In real life, failures are often linked.** The same bad deploy, the same config mistake or the same region outage can take out all copies at once. That's why spare copies alone aren't enough.
 
-**Techniques by failure scope:**
+**What to do for each kind of failure:**
 
-| Failure | Defence |
+| What fails | Defence |
 |---|---|
-| Process crash, memory leak | Supervisors or Kubernetes restarts, liveness probes |
-| Node loss | N+1 replicas behind a health-checked load balancer |
-| Zone loss | Zone-redundant deployments and databases (synchronous standby in another zone) |
-| Region loss | Warm standby or active-active across regions, with a rehearsed failover runbook |
-| Slow or failing dependency | Timeouts, retries with jitter and budgets, circuit breakers, bulkheads (Module 3) |
-| **Bad deploy or configuration** (the most common cause of outages) | Canary and progressive rollout, feature flags, automated rollback on SLO burn, config treated as code |
-| Data corruption or human error | Point-in-time recovery, **immutable** backups, delayed replicas. Replication faithfully copies mistakes, so it is not a backup |
-| Overload | Admission control, load shedding by priority, rate limits, autoscaling with headroom |
+| A process crashes or leaks memory | Automatic restarts (for example Kubernetes), health checks |
+| A machine dies | At least one spare copy behind a health-checked load balancer |
+| A data centre zone goes down | Run copies in several zones. Keep a synchronous database standby in another zone |
+| A whole region goes down | A standby region, with a failover plan you've practised |
+| A service you call is slow or failing | Timeouts, retries with backoff, circuit breakers, separate connection pools (Module 3) |
+| **A bad deploy or config change** (the most common cause of outages) | Release to a small slice of traffic first (canary), feature flags, automatic rollback |
+| Data gets corrupted or deleted by mistake | Point-in-time backups that can't be edited or deleted. Note that replicas copy mistakes too, so a replica is not a backup |
+| Too much traffic | Admission limits, dropping low-priority work, rate limits, autoscaling with spare room |
 
-**Disaster-recovery tiers:**
+**Disaster recovery options:**
 
-| Strategy | RTO | RPO | Cost |
+| Strategy | Time to recover | Data you might lose | Cost |
 |---|---|---|---|
-| Backup and restore | Hours to a day | Last backup (minutes with PITR) | $ |
-| Pilot light (data replicated, compute off) | Tens of minutes to hours | Seconds to minutes | $$ |
-| Warm standby (scaled-down live copy) | Minutes | Seconds | $$$ |
-| Active-active | Near zero | Near zero (per the conflict strategy) | $$$$, plus the Module 4 conflict problems |
+| Backup and restore | Hours to a day | Since the last backup (minutes with point-in-time recovery) | $ |
+| Pilot light (data copied, servers switched off) | Tens of minutes to hours | Seconds to minutes | $$ |
+| Warm standby (a smaller live copy running) | Minutes | Seconds | $$$ |
+| Active-active (full copies all serving traffic) | Almost none | Almost none, but see the conflict problems in Module 4 | $$$$ |
 
-**Health checks done right:**
+**Health checks, done right:**
 
-- **Liveness** asks "is this process wedged?" It should check almost nothing. Checking the database in liveness turns a database blip into a fleet-wide restart storm.
-- **Readiness** asks "should this pod get traffic now?" It fails during warm-up and shutdown, and *may* check critical local dependencies.
-- Beware: if readiness checks a shared database, every pod goes unready at once and the load balancer has nothing to route to. Sometimes serving a degraded response beats serving nothing.
+- **Liveness** asks "is this process stuck?" It should check almost nothing. If it checks the database, one database hiccup restarts every server at once.
+- **Readiness** asks "should this server get traffic right now?" It says no while starting up and shutting down, and it *may* check important dependencies.
+- Be careful: if every server's readiness check depends on the same database, they all go "not ready" together and the load balancer has nowhere to send traffic. Sometimes a partly working answer is better than none.
 
-**Proof, not hope:** run game days, chaos experiments (kill a zone, add latency to a dependency), and **restore drills**. A backup that has never been restored is a hypothesis. Monitor the four golden signals (latency, traffic, errors, saturation) and alert on **SLO burn rate**, not on CPU.
+**Prove it works; don't hope.** Run practice outages ("game days"), deliberately break things in a controlled way (chaos testing), and **practise restoring backups**. A backup you have never restored might not work. Watch the four golden signals (latency, traffic, errors and saturation), and alert when you're burning through your error budget, not when CPU is high.
 
-### Python: liveness vs. readiness, with warm-up and drain
+### Python: liveness vs. readiness, with warm-up and clean shutdown
 
 ```python
 import asyncio
@@ -613,7 +666,7 @@ async def readyz(response: Response) -> dict:
     return {"ready": True}
 ```
 
-On Kubernetes, pair this with a `preStop` hook (for example, sleeping 10 s) and a `terminationGracePeriodSeconds` longer than your slowest request. Load balancers need a few seconds to stop routing to a terminating pod. Without that delay, every deploy drops in-flight requests.
+On Kubernetes, add a `preStop` hook (for example, wait 10 seconds) and a shutdown grace period longer than your slowest request. Load balancers take a few seconds to stop sending traffic to a server that is shutting down. Without that wait, every deploy drops some requests.
 
 ## 0.6 Long-Running Jobs
 
@@ -655,41 +708,41 @@ stateDiagram-v2
 
 *[Open full-size diagram: Job lifecycle (SVG)](diagrams/m0-job-lifecycle.svg)*
 
-### Theory & trade-offs
+### The idea
 
-Some work doesn't fit in a request: generating 3M statements, exporting a customer's data, re-embedding a corpus, reconciling a day's transactions, running a migration backfill. **Long-running jobs outlive the processes that run them.** Deploys, crashes, autoscaling and spot or preemptible eviction all interrupt them. The design goal is that **any job can be interrupted at any moment and resume correctly**.
+Some work is too big for one web request: making 3 million bank statements, exporting a customer's data, re-processing a document library, or running a data migration. **These jobs often run longer than the servers running them stay up.** Deploys, crashes, autoscaling and cloud machines being taken back all interrupt them. The goal is simple to state: **any job can be stopped at any moment and continue correctly later.**
 
-**The API contract: asynchronous request–reply.**
+**How the API should look (asynchronous request–reply):**
 
-1. `POST /jobs` returns **`202 Accepted`** with a `Location: /jobs/{id}` header. It accepts an idempotency key, so a retried submit doesn't start two jobs.
-2. The client polls `GET /jobs/{id}` (state, progress, result link) or receives a webhook, SSE event or email on completion.
-3. `POST /jobs/{id}/cancel` requests cooperative cancellation.
+1. `POST /jobs` replies **`202 Accepted`** with a link (`/jobs/{id}`) where the client can check on the job. The request carries an idempotency key, so sending it twice doesn't start two jobs.
+2. The client checks `GET /jobs/{id}` for status and progress, or gets notified when the job is done (webhook, SSE or email).
+3. `POST /jobs/{id}/cancel` asks the job to stop.
 
-**Execution models:**
+**Ways to run jobs:**
 
-| Model | Examples | Best for | Watch out for |
+| Option | Examples | Best for | Watch out for |
 |---|---|---|---|
-| **Task queue + workers** | Celery, RQ, Dramatiq, Azure Queue Storage / Service Bus + workers | Many short-to-medium independent tasks | Visibility timeouts, duplicate delivery, no built-in multi-step state |
-| **Database-backed queue** | PostgreSQL `FOR UPDATE SKIP LOCKED` | Moderate volume with transactional enqueue (same database as your data) | Polling load, table bloat at very high volume |
-| **Batch compute** | Kubernetes Jobs, Azure Batch, AWS Batch | Large parallel compute (rendering, ML, simulations) | Scheduling latency, cost of idle capacity |
-| **Durable workflow engines** | Temporal, Azure Durable Functions, AWS Step Functions | Multi-step processes lasting minutes to months, with retries, timers, human steps and compensations | A new programming model with determinism rules for workflow code |
-| **Data pipeline orchestrators** | Airflow, Azure Data Factory, Dagster | Scheduled DAGs of data tasks | Not built for per-user, on-demand jobs |
+| **Task queue + workers** | Celery, RQ, Azure Service Bus + workers | Many small or medium tasks | Messages delivered twice. No built-in tracking across steps |
+| **Database as the queue** | PostgreSQL with `FOR UPDATE SKIP LOCKED` | Moderate volume, when the job should be created in the same transaction as your data | Constant polling, and table growth at very high volume |
+| **Batch computing** | Kubernetes Jobs, Azure Batch | Heavy parallel computing | Slow to start. Idle machines cost money |
+| **Durable workflow engines** | Temporal, Azure Durable Functions, AWS Step Functions | Multi-step processes lasting minutes to months, with timers and human approvals | A new way of writing code, with rules to follow |
+| **Pipeline schedulers** | Airflow, Azure Data Factory | Scheduled data pipelines | Not meant for on-demand jobs per user |
 
-**The mechanics that make jobs survivable:**
+**How to make jobs survive failures:**
 
-- **Leases and heartbeats.** A worker claims a job with a time-limited lease and extends it periodically. If the worker dies, the lease expires and another worker picks the job up. Lease length trades recovery speed (short leases) against false expiry during GC pauses or slow chunks (long leases).
-- **Fencing by attempt number.** When a lease expires and a new worker claims the job, the attempt counter increments. Every heartbeat, checkpoint and completion write includes `attempt = :mine`. A stale worker that wakes up can no longer write. This is the same fencing idea as Module 1.
-- **Checkpointing.** Persist a cursor (last processed ID, file offset, page token) after each chunk, so a restart resumes instead of starting over. Checkpoint frequency trades re-done work against write overhead.
-- **Idempotent chunks.** After a crash, at most the last chunk runs twice, so every side effect must tolerate repetition: deterministic output object keys, upserts, dedupe keys on notifications.
-- **Chunking and fan-out.** Split big jobs into many small tasks (map), track completion (a counter or a barrier), then aggregate (reduce). Small tasks retry cheaply and parallelize.
-- **Cancellation is cooperative.** Check a flag at chunk boundaries. Forcibly killing work mid-chunk leaves partial side effects.
-- **Timeouts and poison jobs.** Cap attempts, retry with exponential backoff, and move exhausted jobs to a dead-letter state with an alert. One bad input must not block the queue forever.
-- **Fairness and downstream protection.** Use per-tenant concurrency limits so one customer's 1M-row export doesn't starve everyone else, and global concurrency caps that respect the capacity of the databases and APIs the jobs call.
-- **Graceful shutdown.** On `SIGTERM`, stop claiming, finish or checkpoint the current chunk, and release the lease. Set the orchestrator's grace period to cover one chunk.
+- **Leases and heartbeats.** A worker "borrows" a job for a limited time (a lease) and keeps renewing it (a heartbeat). If the worker dies, the lease runs out and another worker takes over. Short leases recover faster. Long leases are less likely to expire by mistake during a slow step.
+- **Attempt numbers as fencing.** Each time a job is taken over, its attempt number goes up. Every progress update includes "attempt = mine". An old worker that wakes up can no longer overwrite anything. This is the same fencing idea as in Module 1.
+- **Checkpoints.** Save your position after each chunk of work (for example, "last account processed"). A restarted job continues from there instead of starting over. Saving more often means less repeated work but more writes.
+- **Every chunk must be safe to repeat.** After a crash, the last chunk may run twice. So use fixed file names, upserts, and duplicate checks on notifications.
+- **Split big jobs.** Break them into many small tasks that run in parallel, track when they're all done, then combine the results. Small tasks are cheap to retry.
+- **Cancelling is polite.** The job checks a "please stop" flag between chunks. Killing it mid-chunk can leave half-finished changes.
+- **Limit retries.** Retry with growing waits, and after a set number of attempts, move the job to a "failed" (dead-letter) state and alert someone. One bad input must never block the queue forever.
+- **Be fair and protect other systems.** Limit how many jobs each customer can run at once, so one huge export doesn't block everyone else. Cap total concurrency so jobs don't overload the databases and APIs they call.
+- **Clean shutdown.** When the server is told to stop (`SIGTERM`), stop taking new work, finish or checkpoint the current chunk, and release the lease.
 
-**A Celery-specific trap:** with Redis or SQS brokers, a task still running when the broker's **visibility timeout** expires is redelivered to another worker, and you now have two copies running. Set the visibility timeout above the longest task runtime, use `acks_late=True`, and keep tasks short by chunking.
+**Celery trap:** with Redis or SQS brokers, if a task runs longer than the broker's **visibility timeout**, the broker assumes the worker died and gives the task to another worker. Now two copies are running. Set that timeout longer than your longest task, use `acks_late=True`, and split long tasks into chunks.
 
-### Python: a PostgreSQL-backed job runner with leases, fencing and checkpoints
+### Python: a PostgreSQL job runner with leases, fencing and checkpoints
 
 ```sql
 CREATE TABLE jobs (
@@ -796,24 +849,24 @@ async def generate_statements(payload: dict, checkpoint: dict | None, save, canc
     return "cancelled"
 ```
 
-Operational notes:
+Notes:
 
-- A small **reaper** marks jobs as `failed` when their lease expired *and* attempts are exhausted, because the claim query skips them.
-- Run the reaper and `run_one` in a loop with backoff when the queue is empty. Use `LISTEN/NOTIFY` to wake idle workers instead of tight polling.
-- **Choosing a model:** past roughly thousands of jobs per second, or once jobs become multi-step with timers and human approvals, move to a dedicated broker or a durable workflow engine (Temporal or Durable Functions). The lease, fence and checkpoint principles carry over unchanged.
+- Run a small cleanup job (a "reaper") that marks jobs as `failed` when their lease expired *and* they have no attempts left. The claim query skips those jobs.
+- Loop `run_one` with a pause when there's no work. PostgreSQL's `LISTEN/NOTIFY` can wake workers up instead of constant polling.
+- **When to switch:** at thousands of jobs per second, or when jobs have many steps with timers and human approvals, move to a dedicated queue or a workflow engine such as Temporal. The same ideas (leases, fencing and checkpoints) still apply.
 
 ## 0.7 Case Study: A Digital Bank's Mobile Backend, Using All Six
 
-**Scenario:** a Canadian digital bank with 3M customers. The morning peak is 5,000 account-summary reads/s and 800 transfers/s. Customers expect instant balance updates and push notifications. Monthly statements must be generated for every account. SLOs are 99.95% for login and balance and 99.9% for statements and exports.
+**Scenario:** a Canadian online bank with 3 million customers. At the morning peak there are 5,000 account-summary reads and 800 money transfers every second. Customers expect balances to update instantly, with push notifications. Every account needs a monthly statement. Targets: 99.95% uptime for login and balance, and 99.9% for statements and exports.
 
-| Concern | Decision | Why | Trade-off accepted |
+| Concern | What we do | Why | What we accept |
 |---|---|---|---|
-| **Scale reads** | Account summaries served from a Redis read model (single-flight, jittered TTLs). Transaction history from replicas | 5,000 reads/s at a 95% hit ratio leaves 250/s for the database | Summaries can be seconds stale, which is labelled "as of" in the app |
-| **Split reads and writes** | Staleness budgets per endpoint. Authorization reads the primary. The post-transfer view uses a consistency token | Correctness where money moves, scale everywhere else | Routing logic in the application, and token plumbing |
-| **Scale writes** | Ledger partitioned by account (Module 1). Card-network notifications are accepted into a log and applied in micro-batches | 800 TPS sustained with 5× burst headroom | Asynchronous status for some operations |
-| **Real-time data** | Outbox → event bus → push gateways (WebSocket) with sequence numbers and snapshot resync. Mobile push for critical alerts, plus a durable in-app inbox | Instant UX without making the socket the source of truth | A resync path must be built and tested |
-| **Reliability** | Zone-redundant everything, a warm standby region, canary deploys gated on SLO burn, restore drills quarterly | Most outages are deploys and dependencies, not hardware | Standby cost. Slower but safer releases |
-| **Long-running jobs** | Statement generation as a fan-out of 500-account chunks with leases, checkpoints and idempotent PDF keys | 3M statements × ~200 ms ≈ 167 CPU-hours, so ~50 four-core workers finish in under an hour | A job platform to operate |
+| **Scale reads** | Account summaries come from a Redis read model (with single-flight and random TTLs). History comes from replicas | 5,000 reads/s at a 95% hit ratio leaves only 250/s for the database | Summaries can be seconds old, so the app shows "as of" times |
+| **Split reads and writes** | A freshness budget per endpoint. Approvals read the primary. The screen after a transfer uses a token | Exact where money moves, scalable everywhere else | Routing logic in the app, and passing tokens around |
+| **Scale writes** | The ledger is split by account (Module 1). Card network updates go into a queue and are saved in batches | 800 transfers/s, with room for 5× bursts | Some results arrive a moment later |
+| **Real-time data** | Outbox → event bus → WebSocket servers with numbered messages and snapshot reload. Mobile push for important alerts, plus an inbox in the app | Instant updates without trusting the socket to never drop anything | We must build and test the reload path |
+| **Reliability** | Every part in several zones, a standby region, canary deploys that stop when errors rise, and quarterly restore tests | Most outages come from deploys and dependencies, not hardware | Standby costs money. Releases are a bit slower |
+| **Long-running jobs** | Statements are made in chunks of 500 accounts, with leases, checkpoints and fixed PDF file names | 3 million statements × ~200 ms ≈ 167 CPU-hours, so 50 four-core workers finish in under an hour | We need to run a job platform |
 
 ```mermaid
 flowchart LR
@@ -838,43 +891,43 @@ flowchart LR
 
 *[Open full-size diagram: Digital bank backend - all six concerns together (SVG)](diagrams/m0-digital-bank-backend-all-six-concerns-together.svg)*
 
-## 0.8 Animation Blueprints
+## 0.8 Animation Plans
 
-### A. Cache stampede, then single-flight
+### A. A cache stampede, then single-flight
 
-**Scene setup:** 30 small request dots on the left, a cache box in the middle (a key tile `rates:today` with a draining TTL bar), a database box on the right with a **load gauge**, and a latency meter at the bottom.
+**Scene:** 30 small dots (requests) on the left, a cache box in the middle holding one item `rates:today` with a shrinking TTL bar, a database on the right with a load meter, and a response-time meter at the bottom.
 
-| Time | Beat | Visual | Manim primitives |
+| Time | Step | What you see | Manim tools |
 |---|---|---|---|
-| 0:00–0:04 | Warm cache | Dots bounce off the cache tile and return green. The database gauge stays near zero | `MoveAlongPath`, `Indicate(tile)` |
-| 0:04–0:07 | TTL expires | The TTL bar hits zero and the tile greys out | `ValueTracker` driving a `Rectangle` width |
-| 0:07–0:12 | **Stampede** | All 30 dots miss at once and stream to the database. The gauge swings into red, the latency meter spikes, and some dots turn red (timeouts) | `LaggedStart` of 30 arrows, `Rotate(needle)` |
-| 0:12–0:14 | Rewind | Rewind to 0:04. Caption: *Same traffic, single-flight + stale-while-revalidate* | `Restore` |
-| 0:14–0:20 | **Coalesced** | On expiry the tile turns amber (*stale*). One dot goes to the database while the other 29 are served the stale value immediately. The gauge barely moves | One `GrowArrow` to the DB, 29 short bounces |
-| 0:20–0:23 | Refresh lands | The single loader returns, the tile turns green with a new, slightly jittered TTL. Neighbouring keys show different TTL bar lengths | `Transform`, varied bar widths |
-| 0:23–0:26 | Recap | *One loader per key. Serve stale while refreshing. Jitter expiries* | `Write` |
+| 0:00–0:04 | Cache is warm | Dots bounce off the cache and come back green. The database meter stays near zero | `MoveAlongPath`, `Indicate` |
+| 0:04–0:07 | Item expires | The TTL bar reaches zero and the item turns grey | `ValueTracker` controlling the bar width |
+| 0:07–0:12 | **Stampede** | All 30 dots miss at once and rush to the database. Its meter goes red, response time spikes, and some dots turn red (timeouts) | `LaggedStart` of 30 arrows, rotating needle |
+| 0:12–0:14 | Rewind | Back to 0:04. Caption: *Same traffic, with single-flight and stale-while-refresh* | `Restore` |
+| 0:14–0:20 | **Coalesced** | On expiry the item turns amber (*old but usable*). One dot goes to the database, and the other 29 get the old value right away. The database meter barely moves | One arrow to the database, 29 short bounces |
+| 0:20–0:23 | Refreshed | The new value arrives and the item turns green with a slightly random new TTL. Nearby items show different TTL lengths | `Transform`, varied bar widths |
+| 0:23–0:26 | Summary | *One loader per item. Serve old while refreshing. Randomize expiry times* | `Write` |
 
-### B. A long-running job survives a crash
+### B. A long job survives a crash
 
-**Scene setup:** a horizontal progress track of 20 chunks, a job card (`attempt 1`, `lease` ring, `checkpoint: —`), two workers (W1, W2), and an output bucket.
+**Scene:** a progress track of 20 chunks, a job card (`attempt 1`, a lease ring, `checkpoint: —`), two workers (W1 and W2), and a bucket for output files.
 
-| Time | Beat | Visual | Manim primitives |
+| Time | Step | What you see | Manim tools |
 |---|---|---|---|
-| 0:00–0:05 | Claim and run | W1 claims the job. The lease ring starts, and chunks light up one by one while PDFs drop into the bucket | `FadeIn`, `LaggedStart` |
-| 0:05–0:08 | Heartbeat and checkpoint | After every chunk, a checkpoint tag moves along the track (`after_account=…`). The lease ring refills on each heartbeat | `MoveToTarget(tag)`, ring refill |
-| 0:08–0:10 | **Crash** | W1 is struck by a lightning bolt mid-chunk 9. The heartbeat stops and the lease ring drains | `Create(bolt)`, `FadeToColor(GREY)` |
-| 0:10–0:14 | Reclaim | The lease hits zero. W2 claims the job and the card shows `attempt 2`. W2 **starts from the checkpoint after chunk 8**, not from zero. Chunk 9 is redone, and its PDF overwrites the identical object in the bucket (*idempotent*) | `Transform(card)`, `Indicate(chunk9)` |
-| 0:14–0:18 | Zombie write | W1 recovers and tries to write a checkpoint stamped `attempt 1`. It bounces off the job card: *0 rows updated, fenced* | Red `Flash`, the arrow shatters |
-| 0:18–0:22 | Complete | W2 finishes chunk 20. The card turns green: *succeeded, 1 chunk re-done out of 20* | `Circumscribe` |
+| 0:00–0:05 | Start | W1 takes the job. Its lease ring starts, chunks light up one by one, and PDFs drop into the bucket | `FadeIn`, `LaggedStart` |
+| 0:05–0:08 | Heartbeat and checkpoint | After each chunk, a checkpoint tag moves along the track. The lease ring refills with each heartbeat | Moving tag, ring refill |
+| 0:08–0:10 | **Crash** | Lightning hits W1 in the middle of chunk 9. Heartbeats stop and the lease ring runs down | `Create(bolt)`, turn grey |
+| 0:10–0:14 | Takeover | The lease runs out. W2 takes the job, which now shows `attempt 2`. W2 **starts after chunk 8**, not from zero. Chunk 9 runs again and its PDF replaces the identical file (*safe to repeat*) | `Transform`, `Indicate` |
+| 0:14–0:18 | Old worker blocked | W1 wakes up and tries to save progress as `attempt 1`. The write bounces off: *0 rows updated* | Red `Flash`, arrow breaks |
+| 0:18–0:22 | Done | W2 finishes chunk 20. The card turns green: *done, only 1 of 20 chunks repeated* | `Circumscribe` |
 
-## 0.9 Staff-level Review Questions
+## 0.9 Review Questions
 
-- For each endpoint, what is the written staleness budget, and which store serves it?
-- What happens to database load at a 50% cache hit ratio (after a flush), and can the database survive it?
-- Which entity defines write ordering, and what happens when one key receives 100× the average traffic?
-- If a push message is lost, how does the client find out, and how does it recover?
-- Which failure scenario has the longest untested recovery path, and when was the last restore drill?
-- Can every long-running job be killed at any instant and resume correctly? What proves it?
+- For each endpoint, how stale is data allowed to be, and where is it read from?
+- If the cache is flushed and the hit ratio drops to 50%, can the database survive?
+- Which key decides the order of writes, and what happens if one key gets 100 times normal traffic?
+- If a push message is lost, how does the app notice, and how does it recover?
+- Which failure has a recovery path you've never tested? When did you last restore a backup?
+- Can every long job be killed at any moment and continue correctly? How do you know?
 
 ---
 
@@ -882,7 +935,7 @@ flowchart LR
 
 *Industry: Banking & Fintech*
 
-## 1.1 Core Theory & Trade-offs
+## 1.1 Ideas & Trade-offs
 
 ### Event Sourcing
 
@@ -901,25 +954,25 @@ flowchart LR
 
 *[Open full-size diagram: Event sourcing - state is derived from facts (SVG)](diagrams/m1-event-sourcing-state-is-derived-from-facts.svg)*
 
-In a CRUD system the database stores *current state*. In an event-sourced system the database stores *facts that happened*, and state is derived from them:
+**In plain words:** most apps store only the *current* value, such as "balance = 20". Event sourcing stores **every change that happened**, such as "deposited 100" and "withdrew 80", and works out the current value by adding them up.
 
 ```
 state(t) = fold(apply, events[0..t], initial_state)
 ```
 
-A ledger is the canonical case. A bank does not "update a balance". It records `FundsDebited` and `FundsCredited` postings, and the balance is the sum of those postings. Double-entry bookkeeping is event sourcing, invented about 500 years before Kafka.
+A bank ledger is the classic example. Banks don't just overwrite a balance. They record debits and credits (called **postings**), and the balance is the sum of those postings. Double-entry bookkeeping is really event sourcing, invented about 500 years before computers.
 
 | Benefit | Cost |
 |---|---|
-| Complete, tamper-evident audit trail (regulators love it) | Events are immutable forever, so **schema evolution is permanent**. You need upcasters for every historical version |
-| Temporal queries ("balance as of 2025-03-31 23:59:59 ET") | Rebuild time grows linearly. You need snapshots every N events per aggregate |
-| New read models can be built later by replaying history | The right to erasure conflicts with immutability. Use **crypto-shredding** (encrypt PII per data subject, delete the key) |
-| Debugging by replay | Every query needs a projection. "Just add a WHERE clause" goes away |
-| Natural fit for the outbox and CDC | Event design *is* public API design. Bad event granularity is expensive to undo |
+| A complete history of every change, which auditors and regulators love | Events can never be changed, so old event formats must be supported forever |
+| You can ask "what was the balance on March 31 at midnight?" | Adding up millions of events is slow, so you save **snapshots** every N events |
+| You can build new reports later by replaying history | Privacy laws may require deleting personal data. The usual fix is to encrypt each person's data with their own key, and delete the key |
+| You can debug by replaying exactly what happened | Every query needs a precomputed table (a "projection"). You can't just filter a table |
+| Works well with the outbox pattern and CDC | Choosing what an event represents is a big decision that's hard to undo |
 
-**Concurrency on streams.** Appends use optimistic concurrency: `append(stream_id, events, expected_version=v)`. If another writer appended first, the append fails and the command is retried against fresh state. This is a compare-and-swap on the stream head, and it is the core of how event stores (EventStoreDB, Marten, or a Postgres table with a `UNIQUE(stream_id, version)` constraint) avoid lost updates.
+**Stopping two writers from clashing.** When saving new events, you say what version you expect: "append these events, but only if the stream is still at version 7". If someone else added an event first, the save fails and you retry with fresh data. A simple way to build this is a table with a unique constraint on `(stream_id, version)`.
 
-**A pragmatic note.** Most production ledgers are *event-sourcing-lite*: an append-only `postings` table (the events) plus a materialized `accounts.balance` column that is updated in the same ACID transaction. The balance is a cached projection that is *transactionally consistent* with the log. You keep the audit and replay benefits without a separate event store or eventually consistent balances on the hot path.
+**What most real ledgers do.** They keep an append-only `postings` table (the events), plus an `accounts.balance` column that is updated **in the same transaction**. The balance is a cached total that always matches the postings. You get the audit trail without waiting for balances to catch up.
 
 ### CQRS (Command Query Responsibility Segregation)
 
@@ -943,17 +996,20 @@ flowchart LR
 
 *[Open full-size diagram: CQRS - separate write model and read models (SVG)](diagrams/m1-cqrs-separate-write-model-and-read-models.svg)*
 
-CQRS separates the **write model**, which is optimized for enforcing invariants (normalized, small, strongly consistent), from one or more **read models**, which are optimized for specific queries (denormalized, possibly in different stores such as Redis, Elasticsearch or a columnar warehouse).
+**In plain words:** use one model for **changing data** (commands) and different models for **reading data** (queries).
 
-Trade-offs a Principal must be explicit about:
+- The **write model** checks the rules ("is there enough money?"). It is small, strict and always correct.
+- The **read models** are built for specific screens: a balance cache in Redis, a statement table, a search index. They are updated from events, so they may be a little behind.
 
-- **Projection lag creates read-your-writes anomalies.** A user transfers money, refreshes, and sees the old balance. Three standard fixes:
-  1. The command returns a **consistency token** (the ledger version or commit LSN). The query path waits, with a bounded timeout, until the projection's `applied_version >= token`, then falls back to the write model.
-  2. The author's immediate view reads from the write model. Everyone else reads projections.
-  3. The UI renders the optimistic result from the command response.
-- **The operational surface roughly doubles.** You now run projectors, projection rebuilds, dead-letter handling and schema versioning for each read model.
-- **Hard rule for money:** *authorization decisions read the write model, never a projection.* A projection that is 200 ms stale is fine for a statement page and dangerous for approving a withdrawal.
-- **When not to use it:** CRUD-shaped domains where reads and writes are symmetric. CQRS in a settings service is architecture tax with no return.
+Things to be careful about:
+
+- **You might not see your own change right away.** A user transfers money, refreshes, and sees the old balance. Three common fixes:
+  1. The write returns a version number, and the read waits (briefly) until the read model has reached that version, otherwise it reads the write model.
+  2. The person who made the change reads from the write model, and everyone else reads the read models.
+  3. The app shows the expected result straight from the write's response.
+- **There's more to run:** the programs that update read models, rebuilds, error handling, and versioning.
+- **Firm rule for money:** **decisions to approve a payment always read the write model, never a read model.** A read model that's 200 ms behind is fine for a statement page but dangerous for approving a withdrawal.
+- **When not to use it:** simple screens where reading and writing look the same. There, CQRS is extra work for nothing.
 
 ### ACID vs. BASE
 
@@ -980,29 +1036,29 @@ flowchart LR
 
 | | ACID | BASE |
 |---|---|---|
-| Promise | Atomicity, Consistency (invariants), Isolation, Durability | Basically Available, Soft state, Eventually consistent |
-| Scaling unit | A partition or shard | The whole cluster |
-| Failure behavior | Rejects or blocks to preserve invariants | Accepts and reconciles later |
-| Ledger use | Balance mutation, posting creation | Notifications, statements, analytics, fraud features, search |
+| What it promises | All-or-nothing, rules kept, no interference, saved permanently | Available, may be temporarily out of date, catches up later |
+| Where it works | Inside one database or one shard | Across the whole system |
+| When things go wrong | Refuses or waits, to protect the rules | Accepts the work and fixes things up later |
+| Ledger use | Changing balances and saving postings | Notifications, statements, reports, fraud data, search |
 
-Real financial systems are **hybrid**. There is an ACID core *per partition* and BASE everywhere downstream. The design skill is drawing that boundary precisely.
+Real financial systems use **both**: ACID for the money-moving core, and BASE for everything that happens after. Deciding exactly where that line sits is a key design skill.
 
-**Isolation levels are where double-spends actually hide.** In PostgreSQL's default `READ COMMITTED`:
+**Where double-spending bugs really hide: isolation levels.** PostgreSQL's default is `READ COMMITTED`.
 
-- **Unsafe:** `SELECT balance ...` in the application, check `balance >= amount`, then `UPDATE accounts SET balance = :new`. Two concurrent transactions both read 100, both pass the check, and both write 20. That is a classic lost update.
-- **Safe:** `UPDATE accounts SET balance = balance - :amt WHERE id = :id AND balance >= :amt`. The row lock serializes writers, and PostgreSQL *re-evaluates the WHERE clause against the latest committed row version* after acquiring the lock. The second writer sees 20, fails the predicate, and updates zero rows.
-- **Also safe:** `SELECT ... FOR UPDATE` before checking.
-- **Write skew:** under snapshot isolation (`REPEATABLE READ` in PostgreSQL), two transactions can each read a *different* row, check a combined invariant ("joint accounts A+B must stay ≥ 0"), and both commit. Only `SERIALIZABLE` (SSI) or explicit locking of *every row in the invariant* prevents this.
+- **Unsafe:** the app reads the balance, checks `balance >= amount` in Python, then writes the new balance. Two requests both read 100, both pass the check, and both write 20. **160 was paid out of 100.** This is called a *lost update*.
+- **Safe:** `UPDATE accounts SET balance = balance - :amt WHERE id = :id AND balance >= :amt`. The row lock makes the second request wait, and PostgreSQL re-checks the WHERE condition against the latest balance. The second request sees 20, the check fails, and zero rows are updated.
+- **Also safe:** lock the row first with `SELECT ... FOR UPDATE`, then check.
+- **Write skew:** under `REPEATABLE READ`, two transactions can each read a *different* row and both break a rule that covers both rows, such as "joint accounts A + B must stay at or above 0". Only `SERIALIZABLE` isolation, or locking *every* row involved, prevents this.
 
-**Distributed transactions across services:**
+**Transactions that span several services:**
 
-| | Two-Phase Commit (2PC/XA) | Saga |
+| | Two-Phase Commit (2PC) | Saga |
 |---|---|---|
-| Atomicity | Real atomic commit | Semantic: forward steps plus compensations |
-| Isolation | Locks held across participants | None. Intermediate states are visible, so you need "pending/hold" states |
-| Failure mode | Coordinator crash leaves participants **blocked** holding locks | Compensation can fail too, so it must be idempotent and retried |
-| Latency | Two round trips plus lock hold time | Asynchronous steps |
-| Fit | A single database cluster's internal commit (Spanner, CockroachDB) | Cross-service and cross-bank money movement |
+| How | A coordinator asks everyone "ready?", then says "commit" | A chain of steps. Each step has an "undo" step (a *compensation*) |
+| All-or-nothing? | Yes | Not exactly: failed chains are undone step by step |
+| Can others see half-done work? | No, rows stay locked | Yes, so you need "pending" states |
+| If the coordinator crashes | Others wait, **stuck holding locks** | The undo steps can fail too, so they must be safe to retry |
+| Best for | Inside one database cluster | Across services and banks |
 
 ### Idempotency in Distributed Transactions
 
@@ -1025,22 +1081,22 @@ flowchart LR
 
 *[Open full-size diagram: Idempotency key and outbox flow (SVG)](diagrams/m1-idempotency-key-and-outbox-flow.svg)*
 
-Delivery semantics are **at-most-once** (may lose), **at-least-once** (may duplicate) or **exactly-once**. End-to-end exactly-once *delivery* is impossible over an unreliable network. Kafka's exactly-once semantics covers read-process-write loops that stay *inside Kafka*. Once a side effect leaves Kafka (a database write, an ACH file, an email), you are back to at-least-once.
+Messages can be delivered **at most once** (may be lost), **at least once** (may be duplicated) or **exactly once**. True exactly-once delivery across a network is impossible. Kafka's "exactly-once" only covers work that stays inside Kafka. Once you write to a database, send a file or send an email, messages can arrive twice again.
 
-**Effectively-once = at-least-once delivery + an idempotent handler + a dedupe record committed in the same transaction as the side effect.**
+**So: "exactly once" in practice = at-least-once delivery + a handler that is safe to repeat + a "done" record saved in the same transaction as the change.**
 
-Idempotency-key design for a payments API:
+How to design an **idempotency key** for a payments API:
 
-- **Client-generated** UUID per *logical* operation, scoped per client (`UNIQUE(client_id, key)`).
-- **Request fingerprint** (a hash of the canonical body) stored with the key. If the same key arrives with a different payload, return `422`. This catches client bugs that would otherwise silently return the wrong cached response.
-- **Stored response** replayed byte-for-byte on retries.
-- **Retention** longer than the client's maximum retry horizon (typically 24 hours to 7 days).
-- **Deterministic business failures** (insufficient funds) should usually be *persisted and replayed* too. Otherwise a retry after a deposit could succeed, and the client's "same request" now has two different outcomes.
-- **The outbox pattern:** write the domain event into an `outbox` table *in the same transaction* as the postings. A relay (Debezium CDC reading the WAL, or a poller) publishes it. This removes the dual-write problem where the database commit succeeds but the Kafka publish fails.
+- The **client creates** a unique ID (a UUID) for each real operation and sends it in a header. The database has `UNIQUE(client_id, key)`.
+- Save a **fingerprint** (a hash) of the request body with the key. If the same key arrives with a different body, reply `422`. This catches client bugs.
+- **Save the response**, and return it again on retries.
+- **Keep keys longer** than the client's retry window: 24 hours to 7 days.
+- **Save business failures too**, such as "insufficient funds". Otherwise a retry after a deposit could succeed, and the same request would have two different outcomes.
+- **The outbox pattern:** write the event into an `outbox` table *in the same transaction* as the money change. A separate process (CDC such as Debezium, or a poller) publishes it. This avoids the classic bug where the database commit works but publishing to Kafka fails.
 
-## 1.2 Python in Practice: Idempotent Consumers, Celery/FastAPI, and Redis Locks
+## 1.2 Python: Idempotent Consumers, Celery/FastAPI, and Redis Locks
 
-### A Principal-level stance on Redlock
+### A clear position on Redis locks (Redlock)
 
 ```mermaid
 flowchart LR
@@ -1058,16 +1114,16 @@ flowchart LR
 
 *[Open full-size diagram: Locks for efficiency, fences for correctness (SVG)](diagrams/m1-locks-for-efficiency-fences-for-correctness.svg)*
 
-Redlock acquires a lock with a TTL on a majority of N independent Redis masters (typically 5) and treats it as valid for `TTL - elapsed - clock_drift`. The well-known critique (Martin Kleppmann, 2016, with a rebuttal from Salvatore Sanfilippo) is:
+**Redlock** takes a lock with an expiry time on a majority of several independent Redis servers (usually 5). A well-known criticism (Martin Kleppmann, 2016, with a reply from Redis creator Salvatore Sanfilippo) points out:
 
-- **Process pauses** (GC, VM live-migration, page faults) can outlast the TTL. The holder wakes up believing it still holds a lock that has already been granted to someone else.
-- **No fencing token.** The protected resource cannot distinguish a stale holder from the current one.
-- **Timing assumptions.** Safety depends on bounded clock drift and bounded network delay.
-- A *single* Redis with async replication can lose a lock on failover.
+- **A worker can freeze** (garbage collection, a VM pause) for longer than the lock's expiry time. It wakes up thinking it still holds a lock that someone else now has.
+- **There's no fencing token**, so the database can't tell the old owner from the new one.
+- **It depends on timing**, and clocks and networks don't always behave.
+- With a *single* Redis server, a failover can lose the lock completely.
 
-**Pragmatic position:** use a Redis lock for **efficiency** (avoid thundering herds on a hot account, stop workers from piling up and hogging database connections, reduce deadlocks). Enforce **correctness** at the database with a conditional write that includes a **fencing token** or version. If the lock fails, you get extra retries, never a double-spend.
+**Practical position:** use a Redis lock to make things **faster** (fewer workers fighting over the same account, fewer deadlocks). Use the **database** to keep things **correct**, with a conditional write that includes a **fencing token** or version number. If the lock fails, you get some extra retries, never a double-spend.
 
-### FastAPI: an idempotent transfer endpoint
+### FastAPI: a money-transfer endpoint that's safe to retry
 
 ```python
 from __future__ import annotations
@@ -1162,13 +1218,13 @@ async def create_transfer(
         return response
 ```
 
-Design notes:
+Why it's built this way:
 
-- The key claim, invariant check, postings, outbox and stored response all commit **atomically**. There is no window in which money moved but the key is unrecorded.
-- Because everything is in one transaction, an explicit `in_progress` state is unnecessary. You need one when the operation spans *external* calls (for example, a card network authorization). In that case you persist `in_progress`, return `409 Retry-After` to duplicates, and run a recovery sweeper for stuck keys.
-- Add a `CHECK (balance >= 0)` constraint on accounts that cannot go negative. It is a last line of defense that costs nothing.
+- Claiming the key, checking the rules, saving the postings, writing the outbox and saving the response all happen in **one transaction**. There's no moment where money moved but the key wasn't saved.
+- Because it's all one transaction, you don't need an "in progress" state. You *do* need one if the operation calls something outside the database (like a card network). In that case, save "in progress", reply `409 Retry-After` to duplicates, and run a sweeper for stuck keys.
+- Add a `CHECK (balance >= 0)` constraint to accounts that can't go negative. It's a free last line of defence.
 
-### Celery: an idempotent consumer with a fenced lock
+### Celery: a consumer that's safe to repeat, with a fenced lock
 
 ```python
 import secrets
@@ -1252,9 +1308,9 @@ def apply_debit(self, msg_id: str, account_id: str, amount_minor: int) -> str:
 
 **Honest caveats:**
 
-- A Redis `INCR` counter can itself go backwards after an async-replica failover. The strongest variant draws the fence from the database (a sequence, or the row's own `version`), which reduces the scheme to plain optimistic concurrency. The Redis lock then remains purely a contention reducer.
-- If every write already goes through `UPDATE ... WHERE balance >= :a` inside a transaction, *correctness does not need the Redis lock at all*. You add it when hot-row contention exhausts connection pools, or when the critical section includes non-database work you want to serialize.
-- Money uses **integer minor units** or `Decimal`. Never `float`.
+- A Redis counter can go *backwards* if Redis fails over to a replica that was behind. The strongest option takes the fence number from the database (a sequence, or the row's own `version`), which is just optimistic locking. The Redis lock then only reduces contention.
+- If every write already uses `UPDATE ... WHERE balance >= :a` inside a transaction, you *don't need* the Redis lock for correctness. Add it only when busy rows exhaust your connection pool, or when the protected work includes steps outside the database.
+- Store money as **whole cents (integers)** or `Decimal`. **Never use `float`.**
 
 ## 1.3 Case Study: A 10,000 TPS Ledger with Zero Double-Spend
 
@@ -1276,46 +1332,58 @@ flowchart LR
 
 *[Open full-size diagram: Sharded ledger with cross-shard saga (SVG)](diagrams/m1-sharded-ledger-with-cross-shard-saga.svg)*
 
-**Requirements:** 10k TPS sustained, 30k TPS peak (payroll days, Black Friday). p99 authorization latency under 150 ms. RPO = 0 within a region and RTO under 60 s. Zero double-spend. Seven-year audit retention with immutability.
+**Requirements:** 10,000 transactions per second normally, and 30,000 at peak (payday, Black Friday). 99% of payment approvals within 150 ms. No data loss in a region, and recovery within 60 seconds. **No double-spending, ever.** Seven years of records that can't be altered.
 
-### Capacity math
+### Rough numbers
 
-| Quantity | Estimate |
+| What | Estimate |
 |---|---|
-| Postings per second | 10k tx/s × 2 postings = 20k rows/s (60k at peak) |
-| Hot-path write volume | ~500 B per posting including index overhead → ~10 MB/s |
-| Daily growth | 864M transactions/day → roughly 0.8–1 TB/day of postings and events |
-| Seven-year retention | Petabyte scale, so tier it: 90 days hot in OLTP, older data as Parquet in ADLS Gen2 (S3/GCS) with WORM immutability policies |
-| Single-primary ceiling | A well-tuned PostgreSQL primary with synchronous standby and group commit can sustain thousands to low tens of thousands of short write transactions per second. At 30k peak with two-row locks per transaction, there is **no headroom**, and hot rows cap you well below hardware limits |
+| Postings per second | 10,000 × 2 = 20,000 rows/s (60,000 at peak) |
+| Data written | ~500 bytes per posting, including indexes → ~10 MB/s |
+| Growth per day | 864 million transactions/day → about 1 TB/day |
+| Seven years | Petabytes. So keep 90 days in the main database and move older data to cheap storage (Parquet files in ADLS Gen2, S3 or GCS) with "can't delete" (WORM) rules |
+| One database server's limit | A well-tuned PostgreSQL primary with a synchronous standby can handle thousands to low tens of thousands of short write transactions per second. At 30,000 per second, each locking two rows, there is **no spare room**, and busy rows slow things further |
 
-**Conclusion:** partition the write path by account.
+**Conclusion:** split the ledger across several databases, by account.
 
-### Architecture decisions
+### Design decisions
 
-**Partitioning.** Hash account IDs into N ledger shards (start with 32 logical shards mapped onto fewer physical servers, so you can split later without rehashing). An intra-shard transfer is one local ACID transaction. A cross-shard transfer becomes a **saga**: debit the source into a per-shard *suspense* (in-flight) account, then credit the destination. Both steps are idempotent by `transfer_id`, and a reconciler asserts that every suspense account nets to zero.
+**Splitting (sharding).** Hash account IDs into shards. Start with 32 logical shards on fewer servers, so you can split later without rehashing everything. A transfer inside one shard is a normal transaction. A transfer **between** shards becomes a **saga**:
 
-**Three ways to serialize writes per account:**
+1. Move money from the source account into a "money in transit" (**suspense**) account on its shard.
+2. Credit the destination.
 
-| Option | How | Pros | Cons |
+Both steps are safe to repeat thanks to the transfer ID. A reconciliation job checks that every suspense account nets to zero.
+
+**Three ways to make sure one account's writes happen one at a time:**
+
+| Option | How | Good | Bad |
 |---|---|---|---|
-| **A. Row locks per shard** (the code above) | `FOR UPDATE` / conditional `UPDATE` in PostgreSQL | Familiar, strongly consistent, easy to audit | Hot-row contention. Deadlock discipline needed |
-| **B. Single writer per partition** (LMAX / actor style) | Commands keyed by `account_id` into Kafka/Event Hubs partitions. One consumer per partition keeps balances in memory and writes in batches | No locks, very high throughput, deterministic ordering | Rebalancing pauses. The in-memory state must be rebuilt from a snapshot plus log. Harder to operate |
-| **C. Distributed SQL** | Spanner, CockroachDB, YugabyteDB (Raft per range) | Global serializability, automatic resharding | Cross-range transactions pay consensus RTT. Vendor coupling. Cost |
+| **A. Row locks** (the code above) | `FOR UPDATE` or a conditional `UPDATE` in PostgreSQL | Familiar, strictly correct, easy to audit | Busy accounts queue up. Must lock in a fixed order to avoid deadlocks |
+| **B. One worker per partition** | Send commands keyed by account into Kafka/Event Hubs partitions. One worker per partition keeps balances in memory and saves in batches | No locks, very fast, strict order | Pauses when partitions move. The in-memory state must be rebuilt after restarts |
+| **C. Distributed SQL database** | Spanner, CockroachDB, YugabyteDB | Handles splitting for you | Transactions across regions are slower. Vendor lock-in. Cost |
 
-Most regulated banks choose **A**, moving to **B** for the highest-volume flows. Purpose-built ledgers (for example TigerBeetle) take B to its extreme.
+Most banks choose **A**, and use **B** for their busiest flows. Purpose-built ledger databases such as TigerBeetle take option B to the extreme.
 
-**Hot accounts.** A marketplace settlement account may receive 2,000 credits/s. Row locks serialize them at maybe 1–3k/s, and every other transfer touching that row queues behind them. Two fixes:
+**Very busy accounts.** A marketplace account might receive 2,000 payments per second. Row locks handle maybe 1,000–3,000 per second on one row, and everything else touching it waits. Two fixes:
 
-- **Credits are commutative.** Append credit postings without locking the balance, then fold them into the balance in micro-batches. Only *debits* need the invariant check.
-- **Split the balance across K sub-accounts** (`merchant-123#0..#15`). Credits pick a sub-account at random. Reads sum them. Debits either use a sub-account with sufficient funds or run a sweep.
+- **Adding money can happen in any order.** Save the credits without locking the balance, and add them to the balance in small batches. Only *withdrawals* need the "enough money?" check.
+- **Split the balance across K sub-accounts** (`merchant-123#0` to `#15`). Each credit picks one at random, and reads add them up.
 
-**Read side (CQRS).** Projections feed a Redis balance cache (for display only, labeled "as of"), statement tables in a read replica, search in Elasticsearch/Azure AI Search, and analytics in a lakehouse. **Authorization never reads a projection.**
+**Reads (CQRS):** a Redis balance cache (display only, labelled "as of"), statement tables on a replica, search, and reports in a data lake. **Payment approvals never read these.**
 
-**Continuous reconciliation invariants:** postings per `tx_id` sum to zero per currency. The daily trial balance nets to zero. The sum of postings per account equals the account's materialized balance. Projection checksums match the write model. Any break pages the on-call engineer. This is cheaper than any lock and catches the bugs locks cannot.
+**Automatic checks that run all the time:**
 
-**Azure mapping:** Azure Database for PostgreSQL Flexible Server with zone-redundant HA (synchronous standby, RPO 0 in-region) per shard, or Citus-based sharding. Event Hubs with the Kafka endpoint for the event bus. Azure Cache for Redis for locks and caches. ADLS Gen2 with immutability policies for the archive. Key Vault with HSM-backed keys for crypto-shredding.
+- Every transaction's postings add up to zero.
+- The daily trial balance nets to zero.
+- Each account's postings add up to its balance.
+- Read models match the write model.
 
-## 1.4 Mermaid: Command and Query Paths
+Any mismatch alerts the on-call engineer. These checks are cheaper than any lock, and they catch bugs that locks can't.
+
+**Azure services:** Azure Database for PostgreSQL Flexible Server with zone-redundant HA, per shard (or Citus for sharding). Event Hubs (Kafka API) for events. Azure Cache for Redis. ADLS Gen2 with immutability policies for the archive. Key Vault for encryption keys.
+
+## 1.4 Diagram: Command and Query Paths
 
 ```mermaid
 sequenceDiagram
@@ -1376,36 +1444,36 @@ sequenceDiagram
 
 *[Open full-size diagram: Command and query paths (SVG)](diagrams/m1-command-and-query-paths.svg)*
 
-## 1.5 Animation Blueprint: A Double-Spend Race Blocked by a Fenced Lock
+## 1.5 Animation Plan: A Double-Spend Race Blocked by a Fenced Lock
 
-**Scene setup (Manim Community, 1920×1080, 60 fps, dark background):**
+**Scene (Manim, 1920×1080, 60 fps, dark background):**
 
-- **Centre-bottom:** a green `RoundedRectangle` labelled *Ledger DB* containing `balance = 100 | last_fence = 32`.
-- **Top-centre:** a grey padlock-shaped group labelled *Redis lock: free*, with a circular TTL arc beside it.
-- **Left:** worker **W1** (blue circle). **Right:** worker **W2** (orange circle). Each has a speech bubble showing the intent `withdraw 80`.
-- A caption bar along the bottom third shows narration.
+- **Bottom centre:** a green box *Ledger DB* showing `balance = 100 | last_fence = 32`.
+- **Top centre:** a grey padlock labelled *Redis lock: free*, with a timer ring beside it.
+- **Left:** worker **W1** (blue circle). **Right:** worker **W2** (orange circle). Each has a speech bubble saying `withdraw 80`.
+- A caption bar at the bottom for narration.
 
-The animation has three acts, which move from the naive race, to the textbook lock, to the pathology that makes fencing necessary.
+There are three acts: the race with no lock, the race with a lock, and the case where the lock alone isn't enough.
 
-| Time | Act | Visual | Manim primitives |
+| Time | Act | What you see | Manim tools |
 |---|---|---|---|
-| 0:00–0:03 | **I. No lock** | Title card: "Two withdrawals, one balance" | `Write`, `FadeOut` |
-| 0:03–0:07 | I | W1 and W2 both fire a `READ` arrow at the DB at the same moment. Both bubbles show `saw 100` | `GrowArrow` ×2 in `AnimationGroup` |
-| 0:07–0:10 | I | Both compute `100 − 80 = 20` (small calculator glyph above each) | `TransformMatchingTex` |
-| 0:10–0:14 | I | Both `WRITE 20` arrows hit the DB. The balance shows 20. A counter "withdrawn: 160" appears in red | `Transform`, `Flash(color=RED)` |
-| 0:14–0:17 | I | Caption: **"Lost update: 160 paid out of 100."** The screen desaturates and rewinds | `Wiggle`, reverse `ValueTracker` |
-| 0:17–0:21 | **II. Lock** | W1 sends `SET NX PX` to Redis. The lock turns blue, labelled `W1 · token 33`. The TTL arc starts full | `Indicate`, `always_redraw(Arc)` |
-| 0:21–0:24 | II | W2's acquire arrow bounces off the padlock with a small "busy" spark, then arcs back along a dashed path labelled `backoff + jitter` | `MoveAlongPath` on `ArcBetweenPoints`, `Flash` |
-| 0:24–0:28 | II | W1 performs the conditional write. The DB shows `balance = 20 | last_fence = 33`. The lock releases and returns to grey | `Transform`, `set_color` |
-| 0:28–0:33 | II | W2 retries, acquires `token 34`, reads 20, and its bubble shows `20 < 80 → REJECT: insufficient funds` | `Write`, `Circumscribe` |
-| 0:33–0:36 | II | Caption: **"The lock serialised the race. But it only works if the holder is alive and on time…"** | — |
-| 0:36–0:40 | **III. Pause** | Reset to 100 / fence 32. W1 acquires `token 33`, then freezes: it turns grey with an ice-crystal overlay and a label `GC pause 4.2 s` | `set_fill(opacity=0.4)`, `FadeIn` |
-| 0:40–0:44 | III | The TTL arc drains linearly to zero. The padlock pops open: *lock expired* | `ttl.animate.set_value(0)`, `rate_func=linear` |
-| 0:44–0:48 | III | W2 acquires `token 34` and writes. The DB shows `balance = 20 | last_fence = 34` | `Transform` |
-| 0:48–0:53 | III | W1 thaws and, still believing it holds the lock, fires `WRITE ... fence=33`. The arrow hits a shield that rises out of the DB: **`WHERE last_fence < 33` → 0 rows**. The arrow shatters | `GrowFromCenter(shield)`, `ShowPassingFlash`, `FadeOut(arrow, shift=DOWN)` |
-| 0:53–0:58 | III | Side-by-side recap panel: *Lock = efficiency* on the left, *Fence + conditional write = correctness* on the right | `VGroup.arrange(RIGHT)` |
+| 0:00–0:03 | **I. No lock** | Title: "Two withdrawals, one balance" | `Write`, `FadeOut` |
+| 0:03–0:07 | I | W1 and W2 both send a `READ` arrow to the database at the same time. Both bubbles say `saw 100` | Two `GrowArrow`s together |
+| 0:07–0:10 | I | Both work out `100 − 80 = 20` | `TransformMatchingTex` |
+| 0:10–0:14 | I | Both `WRITE 20`. The balance shows 20, and a red counter shows "paid out: 160" | `Transform`, red `Flash` |
+| 0:14–0:17 | I | Caption: **"Lost update: 160 paid out of 100."** The screen fades and rewinds | `Wiggle`, rewind |
+| 0:17–0:21 | **II. With a lock** | W1 takes the lock. It turns blue and shows `W1 · token 33`, and the timer ring starts | `Indicate`, timer arc |
+| 0:21–0:24 | II | W2 tries to take the lock, bounces off with a "busy" spark, and curves back along a dashed path labelled `wait and retry` | `MoveAlongPath`, `Flash` |
+| 0:24–0:28 | II | W1 writes. The database shows `balance = 20 | last_fence = 33`. The lock is released and turns grey | `Transform` |
+| 0:28–0:33 | II | W2 retries, gets `token 34`, reads 20, and its bubble says `20 < 80 → REJECT: not enough money` | `Write`, `Circumscribe` |
+| 0:33–0:36 | II | Caption: **"The lock made them take turns. But only if the lock holder is alive and on time…"** | — |
+| 0:36–0:40 | **III. Freeze** | Reset to 100 / fence 32. W1 takes `token 33`, then freezes: it turns grey with ice, labelled `paused 4.2 s` | Fade, `FadeIn` |
+| 0:40–0:44 | III | The timer ring runs out. The lock opens: *lock expired* | Timer to zero |
+| 0:44–0:48 | III | W2 takes `token 34` and writes. The database shows `balance = 20 | last_fence = 34` | `Transform` |
+| 0:48–0:53 | III | W1 unfreezes, still thinks it has the lock, and sends `WRITE ... fence=33`. A shield rises from the database: **`only if last_fence < 33` → 0 rows**. The arrow breaks | Shield, `ShowPassingFlash`, arrow falls |
+| 0:53–0:58 | III | Summary panel: *Lock = speed* on the left, *Fence + conditional write = correctness* on the right | `VGroup.arrange` |
 
-**Manim skeleton for Act III:**
+**Manim code for Act III:**
 
 ```python
 from manim import *
@@ -1453,13 +1521,13 @@ class FencedLockRace(Scene):
         self.wait()
 ```
 
-## 1.6 Staff-level Review Questions
+## 1.6 Review Questions
 
-- Where exactly is the ACID boundary, and what is the *business* consequence of every piece of state outside it being stale for 5 seconds?
-- What happens to an idempotency key when the operation fails deterministically, and does the client get the same answer on retry?
-- If the Redis cluster is entirely unavailable, does the ledger stop, slow down, or lose correctness? (The right answer is "slow down".)
-- How long does replaying the largest account's stream take, and what is the snapshot policy?
-- Which reconciliation invariant would have detected your last production incident?
+- Exactly which data is protected by transactions, and what would happen to the business if everything else were 5 seconds out of date?
+- When an operation fails for a business reason, is the failure saved, and does a retry get the same answer?
+- If Redis is completely down, does the ledger stop, slow down, or become wrong? (The right answer is "slow down".)
+- How long does it take to replay the biggest account's history, and how often are snapshots taken?
+- Which automatic check would have caught your last production incident?
 
 ---
 
@@ -1467,7 +1535,7 @@ class FencedLockRace(Scene):
 
 *Industry: Generative AI & Autonomous Agents*
 
-## 2.1 Core Theory & Trade-offs
+## 2.1 Ideas & Trade-offs
 
 ### Vector databases and ANN indexing
 
@@ -1489,39 +1557,45 @@ flowchart LR
 
 *[Open full-size diagram: Hybrid retrieval pipeline (SVG)](diagrams/m2-hybrid-retrieval-pipeline.svg)*
 
-Exact k-nearest-neighbour search costs `O(N·d)` per query. For 10M chunks at 1,024 dimensions, that is about 10¹⁰ multiply-adds per query. This is fine as a one-off on a GPU and hopeless at thousands of QPS. **Approximate nearest neighbour (ANN)** indexes trade *recall* for *latency and memory*. Every index decision is a position on that three-way trade-off.
+**In plain words:** an **embedding** turns text into a list of numbers (a **vector**), so texts with similar meaning get similar numbers. A **vector database** stores millions of these and quickly finds the ones closest to a question's vector.
 
-**HNSW (Hierarchical Navigable Small World)** is a multi-layer proximity graph. Think of it as a skip list crossed with a small-world graph:
+Checking every vector one by one is exact but slow. For 10 million chunks of 1,024 numbers each, that's about 10 billion multiplications per question. **ANN (approximate nearest neighbour)** indexes find *almost* the best matches much faster. Every index choice is a balance between three things:
 
-- Each vector is assigned a maximum layer drawn from an exponentially decaying distribution (`level = ⌊−ln(U) · mL⌋`). Most nodes exist only on layer 0, and a few reach the sparse top layers.
-- **Search:** start at the entry point on the top layer, greedily hop to whichever neighbour is closest to the query, and descend a layer when no neighbour improves. On layer 0, run a beam search that keeps the best `ef_search` candidates in a priority queue.
-- **Parameters:**
-  - `M` is the number of neighbours per node (layer 0 usually keeps `2M`). A higher M gives better recall and more memory.
-  - `ef_construction` is the build-time beam width. A higher value gives a better graph and a slower build.
-  - `ef_search` is the query-time beam width. It is the **runtime recall/latency knob**, and it can be tuned per query.
-- **Memory:** vectors plus graph edges. For 10M × 1,024-dim float32 vectors, that is ~41 GB of vectors plus ~2–3 GB of graph at M=16–32. It is **RAM-resident**.
-- **Weaknesses:** deletes are tombstones that degrade graph quality, so plan periodic rebuilds. Builds are slow. Highly selective metadata filters break graph connectivity (see below).
+- **recall**: how often the true best matches are found;
+- **speed**;
+- **memory**.
 
-**Alternatives:**
+**HNSW (Hierarchical Navigable Small World)** is the most popular index. Think of it as a stack of road maps:
 
-| Index | Mechanism | Memory | Recall at fixed latency | Updates | When to use |
+- The **top map** has only a few cities with long highways between them. Lower maps have more cities and shorter roads. The **bottom map** has every point.
+- **Searching:** start at the top, keep moving to whichever neighbour is closest to your question, and drop down a level when you can't get any closer. On the bottom level, keep a shortlist of the best `ef_search` candidates while exploring.
+- **Settings:**
+  - `M` is the number of neighbours each point links to. More means better recall and more memory.
+  - `ef_construction` is how carefully the index is built. Higher gives a better index but builds more slowly.
+  - `ef_search` is how widely to search at question time. This is the **main knob for accuracy vs. speed**, and you can change it for each query.
+- **Memory:** 10 million vectors × 1,024 floats ≈ 41 GB, plus 2–3 GB for the links. **It all lives in RAM.**
+- **Weaknesses:** deleting items leaves gaps that slowly make the index worse, so it needs occasional rebuilds. Building is slow. Strict filters (see below) can break it.
+
+**Other index types:**
+
+| Index | How it works | Memory | Accuracy at the same speed | Updates | Use when |
 |---|---|---|---|---|---|
-| Flat (brute force) | Exact scan, often on GPU | 1× | 100% | Trivial | Fewer than ~1M vectors, or small pre-filtered subsets |
-| **HNSW** | Multi-layer graph | ~1.1–1.5× | Excellent | Good inserts, poor deletes | The default for fewer than ~100M vectors in RAM |
-| IVF-Flat | k-means into `nlist` cells, probe `nprobe` | ~1× | Good | Cheap. Retrain when drift occurs | Large corpora, GPU (FAISS) |
-| IVF-PQ | IVF + product quantization (e.g. 1,024-d float32 = 4 KB → 64 B) | ~0.02× | Lower. Rerank with full vectors | Retrain codebooks | Billions of vectors, cost-bound |
-| DiskANN / Vamana | SSD-resident graph + compressed vectors in RAM | Mostly SSD | Very good | Good | Hundreds of millions of vectors without a RAM budget for HNSW |
+| Flat (check everything) | Exact scan, often on a GPU | 1× | 100% | Easy | Under ~1M vectors, or small filtered subsets |
+| **HNSW** | Layered graph | ~1.1–1.5× | Excellent | Adds are fine, deletes are poor | The default for under ~100M vectors in RAM |
+| IVF-Flat | Group vectors into clusters and search only the nearest clusters | ~1× | Good | Cheap. Retrain when data changes | Large collections, GPU |
+| IVF-PQ | Clusters plus compression (a 4 KB vector becomes 64 bytes) | ~0.02× | Lower. Re-check the top results with full vectors | Retrain | Billions of vectors, on a tight budget |
+| DiskANN | Graph stored on SSD, compressed vectors in RAM | Mostly SSD | Very good | Good | Hundreds of millions of vectors without the RAM for HNSW |
 
-Scalar quantization (int8, 4× smaller) usually costs 1–2 points of recall. Binary quantization (32× smaller) needs a rescoring pass. Always **normalize** embeddings, so that cosine similarity equals dot product and the index can use the cheaper metric.
+Smaller number formats also help: 8-bit numbers use 4× less memory and lose 1–2 points of accuracy, and 1-bit uses 32× less but needs a re-check step. Always **normalize** vectors (scale them to length 1), so the cheaper dot-product calculation gives the same answer as cosine similarity.
 
-**The filtered-search trap.** Enterprise RAG *always* filters: by tenant, jurisdiction, document version, or ACL.
+**The filtering trap.** Business apps always filter, for example by customer, country, document version or who is allowed to see what.
 
-- **Post-filtering** (retrieve top-k, then filter) can return zero results when the filter is selective, because the true matches were never in the top-k.
-- **Pre-filtering** (filter, then brute-force the subset) is exact and fast when the subset is small.
-- **In-traversal filtering** (skip non-matching nodes during the graph walk) degrades sharply as selectivity rises, because the graph fragments into disconnected islands.
-- **Principal answer:** when the filter is a *security or residency boundary*, **partition the index** (per tenant or per jurisdiction) instead of filtering. You get isolation you can audit, predictable recall, and per-partition lifecycle. Reserve metadata filters for soft relevance constraints.
+- **Filter after searching:** find the top 10, then remove those that fail the filter. You might end up with zero results.
+- **Filter before searching:** pick the allowed items, then check them all exactly. This is fast when the allowed set is small.
+- **Filter during the search:** skip disallowed points while walking the graph. With strict filters, the graph falls apart into disconnected islands and results get worse.
+- **Best answer:** when the filter is a **security or legal boundary**, keep **separate indexes** (per customer or per country) instead of filtering. You get isolation you can prove, stable accuracy, and simpler management. Use filters only for "nice to have" relevance rules.
 
-**Hybrid retrieval.** Dense embeddings are weak on exact tokens such as policy numbers, SKUs, and names like "Reg E". Run BM25 and dense search in parallel and fuse them with **Reciprocal Rank Fusion**, `score(d) = Σ 1 / (k + rank_i(d))` with k ≈ 60. Then apply a **cross-encoder reranker** to the top ~50 to pick the final 5–8. The reranker usually adds 30–150 ms and is usually the single biggest quality gain in the pipeline.
+**Hybrid search.** Embeddings are weak at exact words such as policy numbers, product codes and names like "Reg E". So also run a **keyword search (BM25)** in parallel, and merge the two result lists with **Reciprocal Rank Fusion**: each result scores `1 / (60 + its rank)` in each list, and the scores are added. Then a **reranker** model (a cross-encoder) re-scores the top ~50 and picks the best 5–8. It adds about 30–150 ms, and it's usually the single biggest quality improvement.
 
 ### Retrieval-Augmented Generation (RAG) pipelines
 
@@ -1542,26 +1616,28 @@ flowchart LR
 
 *[Open full-size diagram: RAG - offline ingestion and online query paths (SVG)](diagrams/m2-rag-offline-ingestion-and-online-query-paths.svg)*
 
-**Ingestion path (offline or near-real-time):**
-Source (SharePoint, CMS, PDFs) → layout-aware parsing that keeps tables and headings → chunking → metadata enrichment (`doc_id`, `version`, `effective_date`, `jurisdiction`, `acl`) → embedding → upsert.
+**In plain words:** RAG means "look up the right documents first, then ask the AI to answer using them". It keeps answers based on your real documents instead of the model's memory.
 
-- **Versioning is a correctness issue.** When compliance guideline v7 supersedes v6, v6 chunks must stop being retrievable *atomically*. Store `doc_version` plus an `active` flag, or build a new index and swap an alias.
-- **Changing embedding models means re-embedding the whole corpus.** Vectors from different models live in incompatible spaces. Blue/green the index.
+**Preparing documents (done ahead of time):**
+Documents (SharePoint, CMS, PDFs) → read the layout, keeping tables and headings → split into **chunks** → add labels (document ID, version, effective date, country, who can see it) → create embeddings → save to the index.
 
-**Chunking trade-offs:**
+- **Versions matter for correctness.** When policy v7 replaces v6, the v6 chunks must stop showing up *at once*. Store a version and an `active` flag, or build a new index and switch over in one step.
+- **A new embedding model means re-processing everything.** Vectors from different models can't be compared. Build the new index alongside the old one and then switch.
+
+**How to split documents (chunking):**
 
 | Choice | Effect |
 |---|---|
-| Small chunks (200–400 tokens) | Precise matches, but the chunk loses surrounding context and needs more chunks per answer |
-| Large chunks (800–1,500 tokens) | Context preserved, but the embedding is diluted and the prompt costs more tokens |
-| Overlap (10–20%) | Protects sentences split across boundaries, at the cost of index size |
-| Structure-aware (split on headings) | The best default for policy documents |
-| Parent–child ("small-to-big") | Retrieve on small chunks, feed the parent section to the LLM |
-| Contextual header | Prepend `Document › Section › Subsection` to each chunk *before* embedding. It is cheap and noticeably improves recall |
+| Small chunks (200–400 tokens) | Precise matches, but each chunk has less context, so you need more of them |
+| Large chunks (800–1,500 tokens) | More context, but the meaning gets blurred and prompts cost more |
+| Overlap (10–20%) | Sentences split across two chunks are still found. The index is bigger |
+| Split on headings | The best default for policy documents |
+| "Small to big" | Search small chunks, but give the AI the whole section they came from |
+| Add a header | Put `Document › Section › Subsection` at the top of each chunk *before* creating the embedding. It's cheap and noticeably improves results |
 
-**Query path:** input guardrails → conversational query rewrite (turn "what about abroad?" into a standalone question) → hybrid retrieval → rerank → context assembly under a token budget → generation with citations → output checks (grounding, PII, required disclosures).
+**Answering a question:** safety checks → rewrite the question so it makes sense on its own ("what about abroad?" becomes a full question) → hybrid search → rerank → build the prompt within a token budget → generate an answer with citations → final checks (is it backed by the sources? any personal data? required disclaimers?).
 
-**Evaluate retrieval separately from generation.** Most "the LLM hallucinated" incidents are actually retrieval failures: the right chunk never reached the prompt. Track recall@k and MRR on a golden question set in CI, and faithfulness and groundedness on sampled production traffic.
+**Test the search separately from the answer.** Most "the AI made things up" problems are really search problems: the right chunk never reached the prompt. Measure how often the right chunk is in the top results on a fixed set of test questions, in your CI pipeline. Separately, check whether answers stick to their sources, on sampled real traffic.
 
 ### Stream processing and long-lived connections
 
@@ -1582,23 +1658,25 @@ flowchart LR
 
 *[Open full-size diagram: Token streaming with backpressure and cancellation (SVG)](diagrams/m2-token-streaming-with-backpressure-and-cancellation.svg)*
 
+**Streaming the answer.** Users see the answer appear word by word instead of waiting. Two ways to do that:
+
 | | Server-Sent Events (SSE) | WebSocket |
 |---|---|---|
-| Direction | Server → client | Bidirectional |
-| Protocol | Plain HTTP, works over HTTP/2 multiplexing | Upgrade handshake, then its own framing |
-| Proxies and WAFs | Pass through easily | Often need explicit configuration |
-| Reconnection | Built in, with `Last-Event-ID` | Hand-rolled |
-| Best for | **Token streaming** | Barge-in, voice, collaborative agents |
+| Direction | Server → browser | Both ways |
+| Protocol | Normal HTTP | A special upgraded connection |
+| Through proxies and firewalls | Easy | Often needs extra setup |
+| Reconnecting | Built in (`Last-Event-ID`) | You build it yourself |
+| Best for | **Streaming AI answers** | Voice, interrupting mid-answer, collaborative agents |
 
-For a chat bot, SSE is the default. Cancelling mid-stream can be a separate `POST /cancel`.
+For a chatbot, SSE is the default. If the user presses "stop", that can be a separate `POST /cancel` request.
 
-**What actually limits 50k concurrent connections:**
+**What actually limits 50,000 open connections:**
 
-- **Memory is not the problem.** An idle asyncio connection costs tens of KB (socket buffers, TLS state, a coroutine frame), so 50k connections fit comfortably in a handful of pods.
-- **Idle timeouts at load balancers** kill quiet streams while the model is still prefilling. Send an SSE comment (`: ping`) every ~15 s, and check every hop's idle timeout.
-- **Buffering** breaks streaming silently. Disable proxy buffering (`X-Accel-Buffering: no` on nginx) and **disable gzip middleware** on stream routes, because compressors buffer.
-- **Backpressure:** a slow client must not cause unbounded memory growth. Use a bounded per-stream queue, and drop the connection if it stays full.
-- **Cancel on disconnect:** a closed browser tab must free its GPU slot *immediately*. Otherwise abandoned generations consume a real share of fleet capacity.
+- **Memory isn't the problem.** An idle connection in async Python uses tens of KB, so 50,000 connections fit on a few servers.
+- **Load balancers close quiet connections.** While the model is still "thinking", nothing is sent, and a load balancer may close the stream. Send a small comment line (`: ping`) every ~15 seconds, and check the idle timeout at every hop.
+- **Buffering silently breaks streaming.** Turn off proxy buffering (`X-Accel-Buffering: no` on nginx) and **turn off gzip** on streaming routes, because compression waits to collect data.
+- **Backpressure.** A slow client must not make memory grow forever. Use a small queue for each stream, and drop the connection if it stays full.
+- **Stop generating when the user leaves.** A closed browser tab must free its GPU slot *straight away*. Otherwise abandoned answers waste a real share of your GPUs.
 
 ### Model serving optimization
 
@@ -1618,12 +1696,12 @@ flowchart LR
 
 *[Open full-size diagram: LLM inference - prefill, KV cache, decode (SVG)](diagrams/m2-llm-inference-prefill-kv-cache-decode.svg)*
 
-LLM inference has two phases with opposite bottlenecks:
+An LLM answers in two phases that are slow for opposite reasons:
 
-- **Prefill** processes the whole prompt in parallel. It is **compute-bound** and sets **time-to-first-token (TTFT)**.
-- **Decode** produces one token per step per sequence. It is **memory-bandwidth-bound** and sets **time-per-output-token (TPOT)**.
+- **Prefill** reads the whole prompt in one go. It's limited by **compute power**, and it decides the **time to first token (TTFT)**.
+- **Decode** writes the answer one token at a time. It's limited by **memory speed**, and it decides the **time per output token (TPOT)**.
 
-**The KV cache is the capacity constraint**, not FLOPs:
+**The KV cache is the real limit, not compute power.** While writing an answer, the model keeps a working memory (the "KV cache") for every token in the conversation:
 
 ```
 KV bytes per token = 2 (K and V) × layers × kv_heads × head_dim × bytes_per_value
@@ -1632,22 +1710,22 @@ KV bytes per token = 2 (K and V) × layers × kv_heads × head_dim × bytes_per_
 A 4,000-token conversation ≈ 1.3 GB of GPU memory for a single sequence
 ```
 
-Concurrency per GPU is therefore bounded by KV memory. The serving optimizations mostly exist to stretch that budget:
+So how many conversations one GPU can handle depends mostly on this memory. Most serving tricks exist to stretch it:
 
 | Technique | What it does | Trade-off |
 |---|---|---|
-| **Continuous batching** (vLLM, TGI, TensorRT-LLM, SGLang) | Schedules at the iteration level, so new sequences join the batch mid-flight | Larger batches raise throughput *and* raise TPOT. Tune `max_num_seqs` to your SLO |
-| **PagedAttention** | Allocates KV in fixed blocks, eliminating fragmentation | Standard practice now |
-| **Prefix caching** | Reuses KV for a shared prompt prefix (system prompt, static policy text) | Huge win for RAG. Requires *cache-affinity routing* to the replica that holds the prefix |
-| **Quantization** (FP8/INT8/INT4 weights, FP8 KV) | Roughly 2–4× more memory for KV | Quality regression must be measured on *your* eval set |
-| **Speculative decoding** | A small draft model proposes tokens and the large model verifies them | Output-equivalent, but gains depend on acceptance rate. Uses extra memory |
-| **Chunked prefill** | Splits long prefills so they don't stall running decodes | Slightly higher TTFT for long prompts in exchange for stable TPOT |
-| **Prefill/decode disaggregation** | Separate GPU pools for each phase | Best efficiency at scale, but you must transfer KV between pools |
-| **Model tiering** | A small model for intent and routing, the large model only when needed | Adds a routing hop, cuts cost dramatically |
+| **Continuous batching** (vLLM, TGI, TensorRT-LLM, SGLang) | New requests join the running batch at every step instead of waiting for it to finish | Bigger batches mean more total speed but slower tokens per user. Tune `max_num_seqs` to your target |
+| **PagedAttention** | Stores the KV cache in small fixed pages, so no memory is wasted on gaps | Standard now |
+| **Prefix caching** | Reuses the KV cache for a shared start of the prompt (system prompt, fixed policy text) | Huge win for RAG. Requests must be sent to the server that already has that prefix |
+| **Quantization** (8-bit or 4-bit numbers) | 2–4× more room for the KV cache | Quality may drop, so test on *your* questions |
+| **Speculative decoding** | A small model guesses the next few tokens, and the big model checks them in one go | Same output, faster, depending on how often the guesses are right. Uses extra memory |
+| **Chunked prefill** | Splits long prompts so they don't freeze answers already being written | Slightly slower first token for long prompts |
+| **Separate prefill and decode servers** | Different GPU pools for each phase | Best efficiency at large scale, but the KV cache must be moved between them |
+| **Model tiers** | A small model handles simple questions, the big one only when needed | One extra routing step, but much cheaper |
 
-## 2.2 Python in Practice: Async Streaming, Chunking, GPU Queues
+## 2.2 Python: Async Streaming, Chunking, GPU Queues
 
-### SSE gateway with admission control, heartbeats, backpressure and cancellation
+### A streaming endpoint with limits, heartbeats, backpressure and cancelling
 
 ```python
 import asyncio
@@ -1727,9 +1805,9 @@ async def chat_stream(req: Request, body: ChatIn):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 ```
 
-The `locked()` pre-check is not atomic. It is a cheap load-shedding hint, and the timed `acquire` inside the generator is the real gate. Recent Starlette versions also cancel the generator when a send fails, but polling `is_disconnected()` covers the time-to-first-token window, when nothing is being sent yet.
+The `locked()` check at the top isn't perfectly accurate. It's a cheap way to turn people away early, and the timed `acquire` inside is the real limit. Newer Starlette versions also cancel the generator when sending fails, but checking `is_disconnected()` also covers the time before the first token, when nothing has been sent yet.
 
-### Structure-aware token chunking
+### Splitting documents into chunks by tokens
 
 ```python
 from collections.abc import Callable, Iterator, Sequence
@@ -1769,9 +1847,9 @@ def chunk_section(
                     f"{section_path}\n\n{decode(window)}", start)
 ```
 
-Split on headings first (one call per section), then use the token window only inside long sections. In production, snap window edges to sentence boundaries, because raw token windows can cut mid-word.
+Split by headings first (one call per section), then use the token window only inside long sections. In production, move the window edges to sentence boundaries, because raw token windows can cut words in half.
 
-### GPU-bound embedding workers with Ray Serve dynamic batching
+### GPU workers for embeddings, with automatic batching (Ray Serve)
 
 ```python
 from ray import serve
@@ -1799,13 +1877,19 @@ class Embedder:
 embedder_app = Embedder.bind()
 ```
 
-The trade-off is explicit: `batch_wait_timeout_s=0.01` adds up to 10 ms of latency in exchange for GPU utilization that can be an order of magnitude higher. Check the autoscaling key names against your Ray version, because they have been renamed across releases. For CPU-bound steps such as PDF parsing or tokenizing large documents in the gateway, use `loop.run_in_executor(ProcessPoolExecutor(), ...)`. Threads won't help because of the GIL (free-threaded CPython 3.13+ is still maturing).
+The trade-off is clear: waiting up to 10 ms (`batch_wait_timeout_s=0.01`) adds a little delay, but the GPU can do far more work per second by processing many texts at once. Check the autoscaling setting names for your Ray version, because they've changed over time. For CPU-heavy work in Python (reading PDFs, tokenizing big documents), use `ProcessPoolExecutor`. Threads won't help because of Python's GIL.
 
 ## 2.3 Case Study: An Enterprise AI Customer-Service Bot for 50,000 Concurrent Users
 
-**Requirements:** a bank's assistant that (a) fetches real-time account data (balances, recent transactions, card status), (b) retrieves compliance guidelines with citations, and (c) streams responses token by token. TTFT p95 under 1.5 s and ≥ 20 tokens/s per stream. **Zero cross-customer data leakage.** Full auditability.
+**Requirements:** a bank's assistant that:
 
-### Capacity math: "50k concurrent" is not the number that matters
+- looks up live account data (balances, recent transactions, card status);
+- finds compliance rules, with citations;
+- streams answers word by word.
+
+95% of users see the first word within 1.5 seconds, with at least 20 tokens/s after that. **No customer can ever see another customer's data.** Everything must be auditable.
+
+### Rough numbers: "50,000 connected" is not the number that matters
 
 ```mermaid
 flowchart LR
@@ -1820,56 +1904,56 @@ flowchart LR
 
 *[Open full-size diagram: Little's Law sizing for the chat bot (SVG)](diagrams/m2-little-s-law-sizing-for-the-chat-bot.svg)*
 
-Apply Little's Law (`L = λ × W`) with explicit assumptions:
+We use **Little's Law**: *average number of things in progress = arrival rate × time each one takes*.
 
 | Assumption | Value |
 |---|---|
 | Connected users | 50,000 |
-| Mean think time between messages | 90 s |
-| Output length / decode speed | 400 tokens at 30 tok/s ≈ 13 s |
-| TTFT (retrieval + prefill) | ~1 s |
-| Prompt size (system + 5 chunks + history + account JSON) | ~3,000 tokens |
+| Average time between a user's messages | 90 s |
+| Answer length / writing speed | 400 tokens at 30 tokens/s ≈ 13 s |
+| Time to first token (search + prefill) | ~1 s |
+| Prompt size (system + 5 chunks + history + account data) | ~3,000 tokens |
 
-| Derived quantity | Value |
+| Result | Value |
 |---|---|
-| Arrival rate λ | 50,000 / 90 ≈ **555 requests/s** |
-| Concurrent generations L | 555 × 14 s ≈ **7,800 sequences decoding at once** |
-| Aggregate decode throughput | 7,800 × 30 ≈ **234k output tokens/s** |
-| Aggregate prefill | 555 × 3,000 ≈ **1.7M prompt tokens/s** (an 800-token cached prefix removes ~25%) |
-| Live KV cache at 70B class | ~7,800 × ~3,400 tokens × 320 KB ≈ **8–9 TB of KV memory** |
+| New requests per second | 50,000 / 90 ≈ **555 per second** |
+| Answers being written at the same moment | 555 × 14 s ≈ **7,800** |
+| Output tokens per second, in total | 7,800 × 30 ≈ **234,000** |
+| Prompt tokens read per second | 555 × 3,000 ≈ **1.7 million** (a cached shared start of ~800 tokens removes ~25%) |
+| KV cache memory needed (70B-size model) | ~7,800 × ~3,400 tokens × 320 KB ≈ **8–9 TB** |
 
-That last row drives the design. At 70B-class scale, self-hosting this workload means a GPU fleet in the hundreds before any redundancy. The levers, in order of impact:
+That last row changes everything. Running this yourself with a 70B model needs hundreds of GPUs before any spares. The biggest levers, in order:
 
-1. **Tier the models.** Most banking intents ("what's my balance", "freeze my card") need a small model plus a tool call, or no generative model at all. Route only complex policy questions to the large model.
-2. **Cap output tokens** and keep answers concise. Output length drives W linearly.
-3. **Keep prompts short.** Five tight chunks beat twelve loose ones for both quality and KV cost.
-4. **Buy instead of build.** A managed service with reserved capacity (Azure OpenAI provisioned throughput, Bedrock provisioned throughput, Vertex) converts GPU operations into a capacity contract. Self-hosting (vLLM on AKS GPU node pools) wins on unit cost only at sustained high utilization, with an MLOps team to run it.
+1. **Use model tiers.** Most banking questions ("what's my balance?", "freeze my card") need a small model plus one tool call, or no AI at all. Send only complex policy questions to the big model.
+2. **Limit answer length** and keep answers short. Answer length drives the numbers directly.
+3. **Keep prompts short.** Five good chunks beat twelve loose ones, for quality and for cost.
+4. **Buy instead of build.** A managed service with reserved capacity (Azure OpenAI provisioned throughput, Bedrock, Vertex) turns GPU operations into a contract. Running it yourself (vLLM on AKS GPU nodes) is cheaper only if the GPUs are busy most of the time and you have a team to run them.
 
-### Reference architecture decisions
+### Design decisions
 
-- **Stateless stream gateways.** Conversation state lives in Redis or Cosmos DB, so any pod can serve any turn. A short replay buffer (Redis Streams, ~60 s) supports SSE resume via `Last-Event-ID`.
-- **Parallel fan-out to cut TTFT.** The orchestrator runs account-data fetch, retrieval and conversation-history load concurrently (`asyncio.TaskGroup`), so TTFT is `max(...)`, not the sum.
-- **The LLM is never the authority on identity.** The customer ID comes from the *authenticated session*, and the account tool calls core banking with the user's delegated token (on-behalf-of flow). The model can ask for "my recent transactions". It can never choose *whose*. This single rule prevents the most damaging class of prompt-injection incidents.
-- **Retrieved content is untrusted input.** Indirect prompt injection can hide inside ingested documents. Keep tool-calling permissions minimal and require confirmation for anything that changes state.
-- **Retrieval:** hybrid BM25 + HNSW with semantic reranking (Azure AI Search, or pgvector/Qdrant plus a reranker), filtered by product, jurisdiction and `effective_date`, with index partitions per regulatory region.
+- **Stateless streaming servers.** Conversation state lives in Redis or Cosmos DB, so any server can handle any message. A short replay buffer (~60 s) lets clients resume a dropped stream.
+- **Do lookups at the same time.** Fetch account data, search documents and load history in parallel (`asyncio.TaskGroup`). The wait is then the slowest of the three, not all three added together.
+- **The AI never decides whose data to fetch.** The customer ID comes from the *logged-in session*. The account tool calls the core banking system with the user's own token. The model can ask for "my recent transactions" but can never choose *whose*. This one rule prevents the most damaging kind of prompt-injection attack.
+- **Treat retrieved documents as untrusted.** Documents can contain hidden instructions ("indirect prompt injection"). Give tools the fewest permissions possible, and require confirmation for anything that changes data.
+- **Search:** keyword + HNSW hybrid search with reranking (Azure AI Search, or pgvector/Qdrant plus a reranker), filtered by product, country and effective date, with separate indexes per regulated region.
 - **Caching, from safest to riskiest:**
 
 | Layer | Key | Rule |
 |---|---|---|
-| Embedding cache | hash(text, model_version) | Always safe |
-| Retrieval cache | hash(rewritten query, corpus_version, filters) → chunk IDs | Safe with a short TTL |
-| Prefix/KV cache (model server) | Token prefix | Safe. Largest cost win |
-| Exact response cache | Normalized query + corpus_version, **non-personalized intents only** | Allowed for FAQs |
-| Semantic response cache | Embedding similarity above a strict threshold | **Only for compliance-approved, non-personalized answers.** Never for anything that touched account data. A near-miss match returns another customer's context |
+| Embedding cache | hash(text, model version) | Always safe |
+| Search result cache | hash(rewritten question, index version, filters) → chunk IDs | Safe with a short TTL |
+| Prefix cache (on the model server) | The shared start of the prompt | Safe, and the biggest cost saving |
+| Exact answer cache | Normalized question + index version, **general questions only** | OK for FAQs |
+| "Similar question" cache | Questions that are nearly the same | **Only for approved general answers.** Never for anything that used account data, because a near-match could return another customer's answer |
 
-- **Degradation policy (fail closed on compliance):**
-  - Vector search down → do *not* answer policy questions ungrounded. Say so and offer escalation to a human.
-  - Account API down → answer policy questions, and state that account details are temporarily unavailable.
-  - GPU saturation → admission control, then route to the smaller model, then queue with an honest ETA.
-- **Audit record per turn:** prompt template version, retrieved chunk IDs and versions, tool calls (arguments and redacted results), model and version, and output. Keep it immutable and encrypted, with PII redaction before it reaches general-purpose logs.
-- **Observability:** one trace per turn with spans for retrieval, rerank, tools, prefill and decode. Record token counts, TTFT and TPOT as first-class metrics, plus cost per tenant and per intent.
+- **When things break, be safe on compliance:**
+  - Search is down → do **not** answer policy questions without sources. Say so and offer a human.
+  - The account system is down → still answer policy questions, and say account details are temporarily unavailable.
+  - GPUs are full → limit new requests, switch to the smaller model, or queue with an honest wait time.
+- **Audit record for every answer:** prompt template version, retrieved chunk IDs and versions, tool calls, model and version, and the answer. Store it so it can't be changed and is encrypted, and remove personal data before it reaches general logs.
+- **Monitoring:** one trace per answer, showing the time spent in search, reranking, tools, prefill and decode. Track token counts, time to first token and time per token, plus cost per customer and per question type.
 
-## 2.4 Mermaid: RAG Serving Architecture
+## 2.4 Diagram: RAG Serving Architecture
 
 ```mermaid
 flowchart LR
@@ -1932,36 +2016,36 @@ flowchart LR
 
 *[Open full-size diagram: RAG serving architecture (SVG)](diagrams/m2-rag-serving-architecture.svg)*
 
-## 2.5 Animation Blueprint: From Text to Tokens, Vectors, and an HNSW Match
+## 2.5 Animation Plan: From Text to Tokens, Vectors, and an HNSW Match
 
-**Scene setup:** use `ThreeDScene` for the vector-space acts and a plain `Scene` for the tokenizer act. Set `self.set_camera_orientation(phi=70*DEGREES, theta=-45*DEGREES)`. Fix the random seed so the point layout is reproducible.
+**Scene:** use `ThreeDScene` for the 3D parts and a normal `Scene` for the text part. Set the camera angle with `self.set_camera_orientation(phi=70*DEGREES, theta=-45*DEGREES)`. Fix the random seed so the layout is the same every time.
 
-| Time | Act | Visual | Manim primitives / notes |
+| Time | Step | What you see | Manim tools / notes |
 |---|---|---|---|
-| 0:00–0:04 | **1. Input** | The query "Can I dispute a card charge made abroad?" types across the screen | `AddTextLetterByLetter` |
-| 0:04–0:09 | **2. Tokenize** | The sentence splits into rounded "token chips" on sub-word boundaries (e.g. `dis` `pute`). Each chip flips to reveal an integer ID. Caption: *IDs and splits are illustrative and depend on the tokenizer* | `VGroup` of `RoundedRectangle`+`Text`, `Rotate(axis=UP)` flip, then `Transform` to the ID |
-| 0:09–0:15 | **3. Embed** | A tall matrix grid (the embedding table) appears. Each ID highlights its row, and the rows slide out as coloured bars | `Rectangle` grid, `Indicate(row)`, `ReplacementTransform` |
-| 0:15–0:20 | 3 | The bars pass through a stack of translucent transformer blocks. Thin attention lines crisscross between tokens, and the bar colours shift (contextualization) | `Line` with low opacity, `LaggedStart`, colour interpolation |
-| 0:20–0:24 | 3 | Mean pooling: the bars compress into one 1,024-cell heat-strip, the *sentence embedding*. Caption: *an embedding model, not the chat LLM, produces this vector* | `Transform` into a `VGroup` of 1,024 thin rectangles coloured by value |
-| 0:24–0:28 | **4. Normalize** | The strip becomes a 3D arrow from the origin. The arrow snaps its length to touch a translucent unit sphere | `Arrow3D`, `Sphere(opacity=0.1)`, `scale_to_fit` |
-| 0:28–0:35 | **5. Vector space** | Thousands of chunk points fade in, clustered and labelled *Disputes*, *Travel*, *Fees*, *Mortgages*. Caption: *3D UMAP projection. Real space has 1,024 dimensions and distances are distorted here.* The camera begins a slow orbit | `Dot3D` clouds, `begin_ambient_camera_rotation(rate=0.1)` |
-| 0:35–0:38 | 5 | The query point appears as a glowing star between *Disputes* and *Travel* | `Dot3D` with a glow ring, `Flash` |
-| 0:38–0:42 | **6. HNSW layers** | The cloud separates vertically into three translucent planes: L2 (≈10 nodes), L1 (≈100), L0 (all). Vertical dotted lines link a node's copies across layers | `Surface` planes, `DashedLine` |
-| 0:42–0:48 | 6 | **Greedy descent on L2:** start at the entry point and hop edge by edge toward the star. A side panel shows `distance: 0.91 → 0.74 → 0.63`. When no neighbour improves, drop down the dotted line to L1 | `MoveAlongPath`, `DecimalNumber` updating, `Circumscribe` on the local minimum |
-| 0:48–0:54 | 6 | Repeat on L1 with shorter hops. Drop to L0 | Same primitives, faster |
-| 0:54–1:02 | 6 | **Beam search on L0:** a side panel lists the candidate priority queue (`ef_search = 64`, top 8 shown). Nodes light up as they are expanded, and the queue reorders live | `Table`-like `VGroup` re-sorted with `Transform`, highlight via `set_color` |
-| 1:02–1:07 | **7. Rerank** | The top 8 hits pull out into a row with cosine scores. A reranker "lens" passes over them, and they reorder. One lexically similar but irrelevant chunk (*"dispute a parking ticket"*) drops from #2 to #7 | `animate.arrange`, `Indicate` |
-| 1:07–1:12 | **8. Filter failure** (bonus) | Rewind to L0. Apply the filter `jurisdiction = QC`: 98% of nodes grey out. The beam search gets trapped on a disconnected island of matching nodes and returns 2 results instead of 8. Caption: *selective filters fragment the graph* | `set_opacity(0.1)`, red `Cross` on the trapped search |
-| 1:12–1:16 | 8 | Fix: the space splits into per-jurisdiction sub-indexes. The search runs inside the *QC* partition and returns 8 good results | `FadeTransform` to a smaller, dense graph |
-| 1:16–1:20 | **9. Prompt** | The final 5 chunks fly into a prompt template card beside the system prompt. Citation badges `[1]`–`[5]` attach | `ReplacementTransform`, `LaggedStart(FadeIn)` |
+| 0:00–0:04 | **1. Question** | "Can I dispute a card charge made abroad?" types across the screen | `AddTextLetterByLetter` |
+| 0:04–0:09 | **2. Tokens** | The sentence splits into chips, one per token (for example `dis` `pute`). Each chip flips to show a number. Caption: *the exact split and numbers depend on the tokenizer* | Rectangles with text, flip, `Transform` to the number |
+| 0:09–0:15 | **3. Embed** | A tall grid (the embedding table) appears. Each number highlights one row, which slides out as a coloured bar | Grid, `Indicate(row)`, `ReplacementTransform` |
+| 0:15–0:20 | 3 | The bars pass through a stack of see-through blocks (the model's layers). Thin lines cross between tokens, and the colours change as tokens take in context | Faint `Line`s, `LaggedStart`, colour changes |
+| 0:20–0:24 | 3 | The bars merge into one strip of 1,024 colours: the *sentence embedding*. Caption: *an embedding model makes this, not the chat model* | `Transform` into 1,024 thin rectangles |
+| 0:24–0:28 | **4. Normalize** | The strip becomes a 3D arrow from the centre, and the arrow's length snaps to touch a see-through sphere of radius 1 | `Arrow3D`, sphere |
+| 0:28–0:35 | **5. Vector space** | Thousands of chunk dots fade in, in labelled clusters: *Disputes*, *Travel*, *Fees*, *Mortgages*. Caption: *a 3D picture of a 1,024-dimension space, so distances are only rough*. The camera slowly circles | `Dot3D`, ambient camera rotation |
+| 0:35–0:38 | 5 | The question appears as a glowing star between *Disputes* and *Travel* | `Dot3D` with glow, `Flash` |
+| 0:38–0:42 | **6. HNSW layers** | The dots separate into three see-through layers: top (~10 dots), middle (~100) and bottom (all). Dotted vertical lines connect copies of the same dot | Planes, dashed lines |
+| 0:42–0:48 | 6 | **Top layer:** start at the entry point and hop toward the star. A side panel shows the distance shrinking: `0.91 → 0.74 → 0.63`. When no hop helps, drop down a level | `MoveAlongPath`, counting number, `Circumscribe` |
+| 0:48–0:54 | 6 | Same on the middle layer with shorter hops. Drop to the bottom | Same, faster |
+| 0:54–1:02 | 6 | **Bottom layer:** a side panel shows the shortlist (`ef_search = 64`, top 8 shown). Dots light up as they're checked, and the shortlist re-sorts live | Re-sorting list, highlights |
+| 1:02–1:07 | **7. Rerank** | The top 8 line up with scores. A "lens" passes over them and re-orders them. A lookalike chunk (*"dispute a parking ticket"*) falls from #2 to #7 | `animate.arrange`, `Indicate` |
+| 1:07–1:12 | **8. Filter problem** (bonus) | Back to the bottom layer. Apply the filter `country = QC`: 98% of dots turn grey. The search gets stuck on an island and finds only 2 results instead of 8. Caption: *strict filters break the graph* | Fade out, red cross |
+| 1:12–1:16 | 8 | Fix: split into separate indexes per country. Searching the *QC* index finds 8 good results | `FadeTransform` to a smaller graph |
+| 1:16–1:20 | **9. Prompt** | The final 5 chunks fly into a prompt card beside the system prompt, and citation tags `[1]`–`[5]` attach | `ReplacementTransform`, `LaggedStart` |
 
-## 2.6 Staff-level Review Questions
+## 2.6 Review Questions
 
-- What is the recall@10 of the retriever on the golden set, and how much of the quality gap is retrieval rather than generation?
-- How do you guarantee that superseded policy text can no longer be retrieved, and how quickly after publication?
-- Which cache layers could ever return data derived from another customer's account, and what proves they can't?
-- What are the TTFT and TPOT SLOs, and at what batch size does TPOT breach them?
-- When the GPU pool is saturated, which users get degraded first, and is that a product decision or an accident?
+- How often does search find the right chunk in the top 10 on your test questions, and how much of the quality problem is search rather than the AI?
+- How do you make sure an old policy version can no longer be found, and how soon after the new one is published?
+- Could any cache ever return data from another customer's account? What proves it can't?
+- What are your targets for time to first token and time per token, and at what batch size do you miss them?
+- When the GPUs are full, which users get slower service first? Is that a product decision or an accident?
 
 ---
 
@@ -1969,7 +2053,7 @@ flowchart LR
 
 *Industry: Global SaaS & IoT*
 
-## 3.1 Core Theory & Trade-offs
+## 3.1 Ideas & Trade-offs
 
 ### Consensus: Raft and Paxos
 
@@ -1991,25 +2075,33 @@ flowchart LR
 
 *[Open full-size diagram: Raft log replication and commit (SVG)](diagrams/m3-raft-log-replication-and-commit.svg)*
 
-Consensus lets a group of nodes agree on a single ordered log despite crash failures (not Byzantine ones). The **FLP result** says no deterministic protocol can guarantee termination in a fully asynchronous network if even one node may crash. Practical protocols therefore guarantee **safety always** and **liveness only when the network behaves** (partial synchrony, enforced with timeouts).
+**In plain words:** consensus lets a group of machines agree on the same ordered list of changes (a *log*), even if some machines crash. It doesn't handle machines that lie on purpose (that's a different, harder problem).
 
-**Raft in one page:**
+A famous result (**FLP**) shows that no method can *guarantee* agreement will finish if the network can be slow without limit and even one machine may crash. So real systems promise two things: **never agree on something wrong**, and **finish when the network behaves reasonably**. Timeouts decide when to try again.
 
-- **Roles:** follower, candidate, leader. **Terms** are a monotonically increasing logical clock. Any message carrying a higher term forces the receiver to step down and adopt that term.
-- **Election:** a follower that hears no heartbeat within a *randomized* election timeout (150–300 ms in the paper, often 1 s or more in production and WAN deployments) increments its term, votes for itself, and sends `RequestVote`. A node grants at most one vote per term, and **only to a candidate whose log is at least as up-to-date as its own** (compare last log term, then last log index). This *election restriction* guarantees that every elected leader already holds every committed entry.
-- **Replication:** the leader sends `AppendEntries` with `(prevLogIndex, prevLogTerm)`. A follower rejects the call if its log doesn't match there, and the leader backs up until the logs agree, overwriting divergent follower entries.
-- **Commit:** an entry is committed once it is stored on a majority **and** it belongs to the leader's current term. Older-term entries commit indirectly. This is the subtle "Figure 8" case in the Raft paper, and it is why new leaders append a no-op entry immediately.
-- **Quorums:** `n = 2f + 1` tolerates `f` failures. Three nodes tolerate one failure and five tolerate two. **Even cluster sizes add cost without adding tolerance.**
-- **Latency:** commit time equals the leader's fsync plus the RTT to the fastest majority. With five voters across three regions, every write pays roughly the RTT to the second-nearest region.
-- **Production extensions:**
-  - **Pre-vote** stops a node rejoining after a partition from inflating terms and disrupting a healthy leader.
-  - **ReadIndex or leader leases** give linearizable reads. Without them, a deposed leader in a minority partition can serve stale reads.
-  - **Learners** are non-voting replicas.
-  - **Joint consensus** allows safe membership changes.
+**Raft on one page:**
 
-**Raft vs. Paxos:** Multi-Paxos and Raft are equivalent in power. Raft is a strong-leader design optimized for understandability. Leaderless variants such as EPaxos reduce WAN latency at considerable complexity. **Don't implement consensus.** Use etcd, ZooKeeper (ZAB), Consul, or systems that embed Raft (CockroachDB, TiKV, Kafka KRaft).
+- **Roles:** each machine is a *follower*, a *candidate* or the *leader*.
+- **Terms** are election rounds, numbered 1, 2, 3 and so on. A machine that sees a message with a higher term steps down and adopts that term.
+- **Elections:** if a follower hears nothing from the leader for a *random* timeout (150–300 ms in the Raft paper, often 1 s or more in real deployments), it:
+  1. increases the term;
+  2. votes for itself;
+  3. asks the others for votes (`RequestVote`).
 
-**Split brain.** Raft guarantees at most one leader *can commit* per term. It does **not** stop a deposed leader from *believing* it is still leader, or stop *application-level* split brain, such as two regions each accepting writes for the same device. The fix is always the same: attach an **epoch or term to every write**, and have the storage layer reject writes from lower epochs.
+  Each machine votes at most once per term, and **only for a candidate whose log is at least as up to date as its own**. That rule guarantees a new leader already has every agreed change.
+- **Copying changes:** the leader sends new entries to followers (`AppendEntries`), including the position and term of the entry just before them. If a follower's log doesn't match there, it says no, and the leader steps back until the logs match. Followers' extra, unconfirmed entries are overwritten.
+- **Committing:** an entry is final ("committed") once a **majority** has stored it **and** it's from the leader's current term. Entries from older terms become final indirectly. This is a subtle case in the Raft paper, and it's why a new leader immediately adds an empty entry.
+- **Majorities:** with `2f + 1` machines, the group survives `f` failures. 3 machines survive 1 failure, and 5 survive 2. **An even number adds cost but no extra safety.**
+- **Speed:** each commit takes the leader's disk write plus the round trip to the fastest majority. With 5 machines across 3 regions, every write waits on a round trip to another region.
+- **Extras used in production:**
+  - **Pre-vote:** a machine returning after a network split checks first whether it could win, instead of starting pointless elections.
+  - **Leader leases / ReadIndex:** stop a leader that was cut off in a minority group from serving old data.
+  - **Learners:** copies that receive data but don't vote.
+  - **Joint consensus:** a safe way to change which machines are in the group.
+
+**Raft vs. Paxos:** they can do the same things. Raft is easier to understand and has one strong leader. Paxos variants (such as EPaxos) can have no leader, which can be faster across regions but is much more complex. **Don't build consensus yourself.** Use etcd, ZooKeeper or Consul, or databases with Raft built in (CockroachDB, TiKV, Kafka's KRaft).
+
+**Split brain.** Raft guarantees that at most one leader can *commit* in each term. It does **not** stop an old leader from *thinking* it's still in charge. It also doesn't stop split brain in *your application*, for example two regions each accepting changes for the same device. The fix is the same everywhere: **attach an epoch or term number to every write**, and have storage reject writes carrying an older number.
 
 ### Gossip protocols
 
@@ -2032,14 +2124,16 @@ flowchart LR
 
 *[Open full-size diagram: SWIM failure detection (SVG)](diagrams/m3-swim-failure-detection.svg)*
 
-**SWIM-style membership:**
+**In plain words:** machines spread news the way people spread gossip. Each one tells a few random others, and soon everyone knows.
 
-- Each protocol period, a node pings one random peer. If there is no ack, it asks *k* other peers to ping that node indirectly (`ping-req`). If there is still no response, the node is marked *suspect* and then *dead* after a timeout.
-- Membership updates **piggyback** on pings, so dissemination takes `O(log N)` rounds with constant per-node load.
+**SWIM, the most common version, for "who's alive?":**
 
-**Trade-offs:** gossip is probabilistic and eventually consistent, and false positives rise under GC pauses or network jitter. The **phi-accrual detector** (Cassandra, Akka) outputs a continuous suspicion level instead of a binary verdict, letting each subsystem choose its own threshold.
+- Every so often, each machine pings one random machine. If there's no answer, it asks a few *other* machines to ping it (`ping-req`). If there's still no answer, the machine is marked *suspect*, and then *dead* after a timeout.
+- News about who joined or left **rides along on these pings**, so everyone hears it within `O(log N)` rounds, and each machine does only a small, fixed amount of work.
 
-**Rule of thumb:** use gossip for *who is alive and what they advertise*, and consensus for *decisions that must not diverge*. Consul does exactly this: gossip (Serf/memberlist) for membership, and Raft for the service catalog.
+**Trade-offs:** gossip is fast and cheap, but not exact, and news arrives "eventually". Pauses and network hiccups cause false alarms. The **phi-accrual detector** (used by Cassandra and Akka) gives a "suspicion level" instead of yes/no, so each part of the system can choose its own threshold.
+
+**Rule of thumb:** use gossip for *who's alive and what they offer*, and consensus for *decisions everyone must agree on*. Consul uses both: gossip for membership, and Raft for its service catalog.
 
 ### Rate limiting: token bucket vs. leaky bucket
 
@@ -2064,22 +2158,24 @@ flowchart LR
 
 *[Open full-size diagram: Token bucket vs leaky bucket (SVG)](diagrams/m3-token-bucket-vs-leaky-bucket.svg)*
 
-| Algorithm | Behaviour | Burst handling | State | Typical use |
+**In plain words:** rate limiting stops any one client from sending too many requests.
+
+| Method | How it behaves | Bursts | Memory needed | Typical use |
 |---|---|---|---|---|
-| **Token bucket** | Bucket of capacity B refills at r tokens/s. A request spends tokens | **Allows bursts** up to B. Long-run rate is r | 2 numbers | API quotas, per-device limits |
-| **Leaky bucket (queue)** | Requests enter a queue of size Q, drained at a constant r | **Smooths bursts** into a steady output, and adds queueing delay | Queue | Protecting a fragile downstream that needs a steady rate |
-| Leaky bucket (meter) / GCRA | Tracks a "theoretical arrival time" | Mathematically equivalent to a token bucket | 1 number | Telecom, efficient Redis limiters |
-| Fixed window | Counter per window | Up to 2× bursts at window edges | 1 counter | Coarse quotas |
-| Sliding window log | Timestamps of every request | Exact | O(requests) | Low-volume, high-precision cases |
-| Sliding window counter | Weighted blend of two windows | Close approximation | 2 counters | A good general default |
+| **Token bucket** | A bucket holds up to B tokens and refills at r per second. Each request uses a token | **Allows bursts** up to B. Averages r | 2 numbers | API limits, per-device limits |
+| **Leaky bucket (queue)** | Requests wait in a queue of size Q and leave at a steady rate r | **Smooths bursts** into a steady flow. Adds waiting time | A queue | Protecting a fragile system that needs a steady pace |
+| Leaky bucket (counter) / GCRA | Tracks when the next request is allowed | Same result as a token bucket | 1 number | Telecoms, efficient Redis limiters |
+| Fixed window | Count per minute | Up to 2× bursts where two windows meet | 1 counter | Rough limits |
+| Sliding window log | Stores every request's time | Exact | Grows with traffic | Low traffic where precision matters |
+| Sliding window counter | Blends two windows | Close enough | 2 counters | A good general default |
 
-**Distributed rate limiting has three designs:**
+**Rate limiting across many servers:**
 
-1. **Centralized.** A Redis Lua script is atomic and accurate, but adds about a millisecond of RTT and makes Redis a dependency. Decide explicitly whether to **fail open** (protecting a backend) or **fail closed** (billing or abuse quotas).
-2. **Local buckets.** Each of N instances enforces r/N locally. This is fast and inaccurate under uneven load balancing.
-3. **Hybrid.** Local buckets asynchronously lease quota from a central store.
+1. **Central counter** in Redis with a Lua script: exact and atomic, but adds about 1 ms per request, and Redis becomes something you depend on. Decide what happens if Redis is down: **let traffic through** (when protecting a backend) or **block it** (for billing or abuse limits).
+2. **Local limits:** each of N servers allows r/N. Fast, but inaccurate if traffic isn't spread evenly.
+3. **Hybrid:** each server keeps a local bucket and occasionally borrows allowance from a central store.
 
-**Rate limiting is not load shedding.** Rate limits enforce *per-client fairness*. Load shedding is *server self-preservation* driven by the server's own health signals (in-flight concurrency, queue wait time). Adaptive concurrency limits using AIMD or a latency gradient catch overloads that static rate limits miss.
+**Rate limiting is not load shedding.** Rate limits keep things *fair between clients*. Load shedding is a server *protecting itself* based on its own health (how many requests are in flight, how long they've waited). Adaptive limits catch overloads that fixed rate limits miss.
 
 ### Circuit breakers
 
@@ -2096,21 +2192,23 @@ flowchart LR
 
 *[Open full-size diagram: Layered resiliency around one dependency call (SVG)](diagrams/m3-layered-resiliency-around-one-dependency-call.svg)*
 
-A breaker moves through three states:
+**In plain words:** like the electrical breaker in your house. If a service you call keeps failing, stop calling it for a while, so it can recover and your own app doesn't hang.
 
-- **Closed:** calls flow, and outcomes are recorded in a rolling window.
-- **Open:** calls fail fast for a cool-down period, and the caller serves a fallback.
-- **Half-open:** a limited number of probe calls are admitted. Enough successes close the breaker, and any failure re-opens it.
+A breaker has three states:
 
-Design details that decide whether a breaker helps or hurts:
+- **Closed** (normal): calls go through, and results are counted.
+- **Open** (tripped): calls fail immediately for a cool-down period, and you use a fallback.
+- **Half-open** (testing): a few test calls are allowed through. If they succeed, the breaker closes. If one fails, it opens again.
 
-- **Trip on failure *rate* with a minimum call volume.** One failure out of one call is not an outage.
-- **Count slow calls as failures.** A dependency that answers in 9 s is down for practical purposes.
-- **Classify errors.** 5xx responses and timeouts are failures. 4xx responses are the *caller's* bug and must not trip the breaker.
-- **Choose granularity per dependency and per endpoint or shard.** One global breaker in front of a sharded database trips everything when one shard fails.
-- **Timeouts are a prerequisite.** Without a deadline, a hung call never "fails", so the breaker never opens.
-- **Combine with bulkheads** (separate connection pools per dependency) so one slow dependency cannot exhaust every worker.
-- **Retries go *outside* the breaker, with backoff, full jitter and a retry budget.** Three layers retrying three times each is **27× amplification** during an outage. Cap retries at around 10% of traffic.
+Details that decide whether a breaker helps or hurts:
+
+- **Trip on a failure *rate*, with a minimum number of calls.** One failure out of one call isn't an outage.
+- **Count slow calls as failures.** A service that answers in 9 seconds is effectively down.
+- **Only count the right errors.** 5xx errors and timeouts are the other service's fault. 4xx errors are *your* bug and shouldn't trip the breaker.
+- **Use one breaker per service and endpoint (or shard).** A single breaker for a whole sharded database trips everything when one shard fails.
+- **You need timeouts first.** Without a timeout, a hung call never "fails", so the breaker never opens.
+- **Use separate connection pools per service (bulkheads)**, so one slow service can't use up all your workers.
+- **Put retries *outside* the breaker**, with backoff, jitter and a budget. If three layers each retry three times, one failed request becomes **27** requests during an outage. Cap retries at about 10% of traffic.
 
 ### Graceful degradation
 
@@ -2131,20 +2229,22 @@ flowchart LR
 
 *[Open full-size diagram: Degradation ladder (SVG)](diagrams/m3-degradation-ladder.svg)*
 
-Design an explicit **degradation ladder** with product owners *before* the incident:
+**In plain words:** when things get bad, keep the most important features working and switch off the rest, instead of failing completely.
 
-| Level | Behaviour |
+Plan the steps with the product team **before** anything breaks:
+
+| Level | What happens |
 |---|---|
-| L0 Full | All features |
-| L1 Reduced | Serve stale caches (stale-while-revalidate). Disable recommendations, rich analytics and non-critical enrichment |
-| L2 Core only | Critical paths only. Low-priority traffic is shed by priority class |
-| L3 Static | Static fallback responses, queue-and-acknowledge writes |
+| L0 Full | Everything works |
+| L1 Reduced | Serve older cached data. Turn off recommendations, rich reports and extras |
+| L2 Core only | Only critical features work. Low-priority traffic is turned away |
+| L3 Static | Show simple fixed responses. Accept writes into a queue and confirm them later |
 
-Priority-based shedding needs every request tagged with a criticality class at the edge. Health checks and the control plane come first, safety alarms next, and bulk telemetry last.
+To turn away the least important work first, every request needs a priority label from the start. Health checks and control traffic come first, safety alarms next, and bulk data last.
 
-## 3.2 Python in Practice: Resiliency Patterns
+## 3.2 Python: Resiliency Patterns
 
-### Retries with `tenacity`: retry only what's retryable
+### Retries with `tenacity`: only retry what's worth retrying
 
 ```python
 import httpx
@@ -2173,7 +2273,7 @@ async def push_device_config(client: httpx.AsyncClient, device_id: str, cfg: dic
     r.raise_for_status()
 ```
 
-`tenacity` is a retry library, not a circuit breaker. Libraries such as `pybreaker` and `aiobreaker` exist, but a breaker is small enough that owning it pays off in observability and correct async semantics.
+`tenacity` handles retries, but it's not a circuit breaker. Libraries such as `pybreaker` and `aiobreaker` exist, but a breaker is small enough that writing your own gives you better monitoring and correct async behaviour.
 
 ### A custom async circuit breaker
 
@@ -2281,7 +2381,7 @@ class CircuitBreaker:
             await self._record(probe, failed=False)
 ```
 
-Usage, with a timeout inside the breaker so slow calls count as failures, and a degradation path when it opens:
+How to use it, with a timeout inside the breaker so slow calls count as failures, and a fallback when it's open:
 
 ```python
 tsdb_breaker = CircuitBreaker(
@@ -2299,9 +2399,9 @@ async def write_batch(batch: list[dict]) -> None:
         await spill_to_local_queue(batch)   # graceful degradation: durable buffer, replay later
 ```
 
-Each process keeps its own breaker state. Across 200 pods, every pod learns about failures independently, which is usually desirable because each sees its own network path. Sharing state through Redis adds a dependency to the very component meant to survive dependency failures.
+Each server process keeps its own breaker. With 200 servers, each learns about failures on its own, which is usually fine because each sees its own network path. Sharing the breaker state through Redis would add a dependency to the very part that's meant to survive dependency failures.
 
-### Atomic distributed token bucket (Redis + Lua)
+### A rate limiter shared by all servers (Redis + Lua token bucket)
 
 ```python
 import redis.asyncio as redis
@@ -2353,47 +2453,52 @@ flowchart LR
 
 *[Open full-size diagram: IoT - AP data plane, CP control plane (SVG)](diagrams/m3-iot-ap-data-plane-cp-control-plane.svg)*
 
-**Scenario:** 8M industrial sensors and smart meters across North America, the EU and APAC. Each device sends a heartbeat every 10 s and a telemetry batch every 60 s, and receives configuration and firmware commands. EU device data must stay in the EU. Inter-region links fail occasionally, and regional data centres have experienced partitions in which both sides stay reachable by devices. That is the definition of a split-brain risk.
+**Scenario:** 8 million industrial sensors and smart meters across North America, the EU and Asia-Pacific. Each device sends a "still alive" message (heartbeat) every 10 seconds and a batch of readings every 60 seconds, and receives settings and firmware updates. EU device data must stay in the EU. Links between regions sometimes fail, and data centres have split in two while devices could still reach both halves. That's exactly how split brain happens.
 
-### Capacity math
+### Rough numbers
 
 | Stream | Rate | Size | Bandwidth |
 |---|---|---|---|
-| Heartbeats | 8M / 10 s = **800k msg/s** | ~200 B | ~160 MB/s |
-| Telemetry | 8M / 60 s = **133k msg/s** | ~1 KB | ~133 MB/s |
-| Total | ~930k msg/s | | ~300 MB/s ≈ **26 TB/day** before compression |
+| Heartbeats | 8M / 10 s = **800,000 messages/s** | ~200 bytes | ~160 MB/s |
+| Readings | 8M / 60 s = **133,000 messages/s** | ~1 KB | ~133 MB/s |
+| Total | ~930,000 messages/s | | ~300 MB/s ≈ **26 TB/day** before compression |
 
-### The key decision: pick the CAP position per data type, not per system
+### The key decision: choose consistency vs. availability *per type of data*
 
-| Data | Semantics | Choice | Mechanism |
+The **CAP theorem** says that when the network splits, a system must choose between staying **available** (AP: keep accepting work) and staying **consistent** (CP: refuse work rather than risk conflicts). You don't have to make one choice for the whole system. Choose for each kind of data:
+
+| Data | What it's like | Choice | How |
 |---|---|---|---|
-| **Telemetry readings** | Append-only facts, commutative | **AP** | Accept anywhere. Dedupe on `(device_id, boot_id, seq)`. Event-time watermarks handle late data |
-| **Presence (online/offline)** | Soft state, self-healing | **AP** | In-memory last-seen at the connection broker. Emit *transitions* only |
-| **Device shadow / desired config** | Must not diverge | **CP per device** | Single home region per device. Writes carry an **ownership epoch** |
-| **Firmware rollout plan** | Global, rare, high-impact | **CP, global** | Consensus-backed control plane plus human approval |
-| **Usage metering for billing** | Must reconcile | Eventual + reconciled | Idempotent counters, daily reconciliation |
+| **Sensor readings** | Facts that are only ever added. Order doesn't matter when merging | **AP** | Accept them anywhere. Remove duplicates by `(device_id, boot_id, seq)`. Handle late data with watermarks |
+| **Online/offline status** | Temporary, and fixes itself | **AP** | Keep "last seen" in the broker's memory. Only send changes |
+| **Device settings (shadow)** | Must never conflict | **CP per device** | Each device has one home region that makes changes, with an ownership **epoch** |
+| **Firmware rollout plan** | Global, rare, high-impact | **CP, global** | A consensus-backed control system, plus human approval |
+| **Usage counts for billing** | Must add up in the end | Eventual, then checked | Counters that are safe to repeat, and a daily check |
 
-### Architecture decisions
+### Design decisions
 
-- **Cells.** Each region runs several independent cells (MQTT broker cluster, stream processor, TSDB shard set). A cell has a bounded device count, so its blast radius is bounded too. Devices are assigned to a *home cell*.
-- **Heartbeats never hit a database.** The broker tracks `last_seen` in memory and publishes only `online→offline` and `offline→online` transitions. That turns 800k writes/s into perhaps thousands, which is the single biggest cost reduction in the design.
-- **Telemetry path:** MQTT broker (Azure Event Grid MQTT broker, IoT Hub, EMQX or HiveMQ) → Event Hubs/Kafka partitioned by `device_id` → stream processor (dedupe, enrichment, downsampling) → time-series store (Azure Data Explorer, Timescale, or InfluxDB). Raw data lands in ADLS/Parquet.
-- **Split-brain handling for the device shadow:**
-  - Each device's shadow has exactly one writer, its home region, which holds an ownership lease with an epoch recorded in a regional etcd/Raft store.
-  - Moving ownership to another region (a failover) requires a quorum decision in a **global control plane spanning at least three sites**: two regions plus a witness. The side of a partition that lacks quorum **cannot** take ownership.
-  - Every shadow write and every command sent to a device carries the epoch. When the partition heals, writes stamped with a lower epoch are rejected, and devices ignore commands with a stale epoch.
-  - The isolated minority side stays **fully available for telemetry** (AP), keeps shadows read-only (CP), and buffers commands. Availability is partial but coherent.
-- **Reconnect storms.** When a region recovers, millions of devices reconnect at once, and TLS handshakes saturate CPU.
-  - **Firmware must implement exponential backoff with full jitter.** This cannot be fixed server-side after shipping, so it is a Day 0 requirement.
-  - The broker applies token-bucket admission on `CONNECT` and returns MQTT 5 reason code *Server busy* when over budget.
-  - Use TLS session resumption to cut handshake cost.
-- **Protecting downstreams:** a per-device token bucket at the broker contains firmware bugs that spam messages. Per-tenant quotas protect shared cells. Circuit breakers sit in front of TSDB writes, spilling to durable Event Hubs retention when the breaker opens, with replay once it closes.
-- **Degradation ladder for this system:**
-  - L1: broadcast a command that raises the heartbeat interval to 60 s and drops debug-level telemetry.
-  - L2: accept only alarm-class messages.
-  - L3: devices store and forward from their local buffer. Firmware must support this.
+- **Cells.** Each region runs several independent "cells" (an MQTT broker cluster, a stream processor, a time-series database). Each cell has a maximum number of devices, so a problem in one cell affects only that many. Each device belongs to a *home cell*.
+- **Heartbeats never reach a database.** The broker tracks `last_seen` in memory and only publishes *changes* (went offline, came back online). That turns 800,000 writes per second into maybe a few thousand, which is the biggest cost saving in the design.
+- **Readings path:** MQTT broker (Azure Event Grid MQTT, IoT Hub, EMQX or HiveMQ) → Event Hubs/Kafka, split by `device_id` → stream processor (remove duplicates, add details, reduce detail) → time-series database (Azure Data Explorer, Timescale, InfluxDB). Raw data is also saved to ADLS as Parquet files.
+- **Avoiding split brain for device settings:**
+  - Each device's settings have exactly one owner, its home region, which holds a lease with an epoch number (stored in the region's etcd/Raft store).
+  - Moving ownership to another region requires a majority vote in a **global control system spread across at least 3 sites** (two regions plus a tiebreaker). The side of a split without a majority **can't** take ownership.
+  - Every settings change and every command sent to a device carries the epoch. After the split heals, changes with an older epoch are rejected, and devices ignore commands with an old epoch.
+  - The cut-off side **keeps accepting sensor readings** (AP), keeps settings read-only (CP), and holds commands until the link returns. It's partly available, but never inconsistent.
+- **Reconnect storms.** When a region recovers, millions of devices reconnect at once, and the encryption handshakes overload the servers.
+  - **Device firmware must retry with growing, random waits.** This can't be fixed on the server after devices ship, so it must be designed in from day one.
+  - The broker limits new connections with a token bucket and replies "server busy" (MQTT 5 has a code for this) when over the limit.
+  - TLS session resumption makes reconnecting cheaper.
+- **Protecting other systems:**
+  - A per-device rate limit at the broker stops buggy firmware from flooding the system.
+  - Per-customer limits protect shared cells.
+  - Circuit breakers sit in front of database writes. When they open, data waits safely in Event Hubs and is replayed once the database recovers.
+- **Degradation steps for this system:**
+  - L1: tell devices to send heartbeats every 60 s instead of 10 s, and stop debug data.
+  - L2: accept only alarms.
+  - L3: devices store data locally and send it later. The firmware must support this.
 
-## 3.4 Mermaid: Circuit Breaker State Transitions
+## 3.4 Diagram: Circuit Breaker State Transitions
 
 ```mermaid
 flowchart TD
@@ -2436,37 +2541,37 @@ flowchart TD
 
 *[Open full-size diagram: Circuit breaker state transitions (SVG)](diagrams/m3-circuit-breaker-state-transitions.svg)*
 
-## 3.5 Animation Blueprint: Raft Leader Election When the Leader Goes Offline
+## 3.5 Animation Plan: Raft Leader Election When the Leader Goes Offline
 
-**Scene setup:**
+**Scene:**
 
-- Five nodes **S1–S5** on a pentagon, each drawn as a circle with a **term badge** (top right), a **role label** below, and an **election-timer ring** around it (an `Arc` driven by a `ValueTracker`).
-- Under each node sits a row of small log squares, coloured by term (term 1 grey, term 2 blue, term 3 green) and numbered by index.
-- **S1** is the gold leader in term 2. S5's log is shorter (index 5) than the others (index 7).
-- A seeded RNG sets the timeouts: S2 = 210 ms, S3 = 170 ms, S4 = 260 ms, S5 = 190 ms, rendered at slow-motion scale.
+- Five machines **S1–S5** arranged in a pentagon. Each is a circle with a **term badge** (top right), a **role label** underneath, and an **election timer ring** around it.
+- Under each machine is a row of small log squares, coloured by term (term 1 grey, term 2 blue, term 3 green) and numbered.
+- **S1** is the gold leader in term 2. S5's log is shorter (5 entries) than the others' (7).
+- Timeouts are fixed for repeatability: S2 = 210 ms, S3 = 170 ms, S4 = 260 ms, S5 = 190 ms, shown in slow motion.
 
-| Time | Beat | Visual | Manim primitives |
+| Time | Step | What you see | Manim tools |
 |---|---|---|---|
-| 0:00–0:06 | **Steady state** | S1 sends heartbeat dots along its edges every beat. Each follower's timer ring snaps back to full on receipt. Caption: *Heartbeats are empty AppendEntries* | `MoveAlongPath(Dot)`, `ttl.animate.set_value(1)` |
-| 0:06–0:08 | **Leader crash** | S1 fades to grey, a red ✕ appears, and heartbeats stop | `FadeToColor`, `Create(Cross)` |
-| 0:08–0:12 | **Timers drain** | All four rings drain at their own speeds. A small ms label per node shows the randomized timeout | Per-node `ValueTracker`, `rate_func=linear` with different `run_time` |
-| 0:12–0:14 | **S3 times out first** | S3 turns amber and becomes *Candidate*. Its term badge flips 2 → 3. A vote counter `1/5` appears (it votes for itself) | `Transform(badge)`, `Indicate` |
-| 0:14–0:18 | **RequestVote** | Envelopes labelled `term=3, lastLogIndex=7, lastLogTerm=2` travel to S2, S4 and S5. Each receiver's term flips to 3 and its ring resets | `LaggedStart(MoveAlongPath)` |
-| 0:18–0:21 | **Votes** | S2 and S4 return green ✓ envelopes, and the counter becomes `3/5`. A **majority** banner flashes | `Flash`, `ChangeDecimalToValue` |
-| 0:21–0:24 | **New leader** | S3 turns gold, gains the crown and sends heartbeats immediately. Every ring resets | `Transform`, `LaggedStart` |
-| 0:24–0:30 | **Commit a no-op** | S3 appends a green term-3 entry at index 8 and replicates it. As acks arrive, a *commitIndex* marker slides to 8 once 3 of 5 hold the entry | `FadeIn(square)`, `MoveToTarget(marker)` |
-| 0:30–0:36 | **Inset: why S5 couldn't win** | A picture-in-picture replay shows S5 timing out first with `lastLogIndex=5`. S2, S3 and S4 reply ✕, because a stale log means no vote. Caption: *The election restriction keeps committed entries safe* | `Rectangle` inset, scaled `VGroup` copy |
-| 0:36–0:42 | **Old leader returns** | S1 revives, still thinks it is a term-2 leader, and sends `AppendEntries term=2` with an uncommitted entry at index 8. The followers reply `term=3`. S1 flips to *Follower*, its term badge jumps to 3, and its conflicting index-8 entry is struck through in red and replaced by S3's green entry | `Transform`, `Strikethrough`-style `Line`, `ReplacementTransform` |
-| 0:42–0:50 | **Bonus: split vote** | New scenario in term 4: S2 and S4 time out together, and each gets 2 votes. Both counters stall at `2/5`, the timers re-randomize, and S4 wins in term 5. Caption: *Randomized timeouts make split votes rare and short* | Parallel `AnimationGroup`s |
-| 0:50–1:00 | **Bonus: network partition** | A red dashed line cuts {S1, S2} from {S3, S4, S5}. A client write sent to S1 shows a spinning *pending* ring that never completes (2/5). The majority side commits normally. Caption: *No majority, no commit. Raft prevents split-brain commits, not split-brain beliefs* | `DashedLine`, `Rotate(ring)` loop |
+| 0:00–0:06 | **Normal** | S1 sends heartbeat dots along its lines. Each follower's timer ring refills when a dot arrives. Caption: *Heartbeats are empty AppendEntries messages* | `MoveAlongPath(Dot)`, ring refill |
+| 0:06–0:08 | **Leader crashes** | S1 turns grey with a red ✕. Heartbeats stop | `FadeToColor`, `Create(Cross)` |
+| 0:08–0:12 | **Timers run down** | The four rings drain at different speeds, each labelled with its random timeout | One `ValueTracker` per machine, different run times |
+| 0:12–0:14 | **S3 times out first** | S3 turns amber (*Candidate*). Its term badge flips from 2 to 3. A vote counter shows `1/5` (its own vote) | `Transform`, `Indicate` |
+| 0:14–0:18 | **Asking for votes** | Envelopes labelled `term=3, lastLogIndex=7, lastLogTerm=2` travel to S2, S4 and S5. Each receiver's term flips to 3 and its timer resets | `LaggedStart(MoveAlongPath)` |
+| 0:18–0:21 | **Votes** | S2 and S4 send back green ✓ envelopes. The counter reaches `3/5` and a **majority** banner flashes | `Flash`, counter change |
+| 0:21–0:24 | **New leader** | S3 turns gold, gets a crown, and sends heartbeats straight away. All rings reset | `Transform`, `LaggedStart` |
+| 0:24–0:30 | **First commit** | S3 adds an empty green term-3 entry at position 8 and sends it out. When 3 of 5 have it, a *committed* marker slides to position 8 | `FadeIn(square)`, moving marker |
+| 0:30–0:36 | **Side panel: why S5 couldn't win** | A small replay shows S5 timing out first with only 5 entries. S2, S3 and S4 all reply ✕, because a shorter log means no vote. Caption: *This rule keeps committed entries safe* | Inset panel, scaled copy |
+| 0:36–0:42 | **Old leader returns** | S1 recovers, still thinks it's the term-2 leader, and sends `AppendEntries term=2` with an uncommitted entry at position 8. The followers reply `term=3`. S1 becomes a *Follower*, its term jumps to 3, and its conflicting entry is crossed out in red and replaced with S3's green one | `Transform`, strikethrough `Line`, `ReplacementTransform` |
+| 0:42–0:50 | **Bonus: tied vote** | New round, term 4: S2 and S4 time out together and each gets 2 votes. Both counters stall at `2/5`, the timers reset randomly, and S4 wins in term 5. Caption: *Random timeouts make ties rare and short* | Two parallel animation groups |
+| 0:50–1:00 | **Bonus: network split** | A red dashed line separates {S1, S2} from {S3, S4, S5}. A write sent to S1 shows a spinning *pending* ring that never finishes (only 2 of 5). The majority side commits normally. Caption: *No majority, no commit. Raft prevents split-brain commits, not split-brain beliefs* | `DashedLine`, spinning ring |
 
-## 3.6 Staff-level Review Questions
+## 3.6 Review Questions
 
-- For each data type, have we chosen CP or AP explicitly, and does the product team agree with that choice?
-- What stops a region on the losing side of a partition from issuing commands? Point to the specific epoch check.
-- What is the worst-case retry amplification across all layers during a full dependency outage?
-- Which breaker trips first when one database shard of 32 fails, and does it take the other 31 with it?
-- How long does a full reconnect of the largest region take under admission control, and has it been load-tested?
+- For each type of data, have we chosen availability or consistency on purpose, and does the product team agree?
+- What stops a region on the losing side of a split from sending commands? Point to the exact epoch check.
+- During a full outage of a service, what's the worst-case number of retries across all layers?
+- When 1 of 32 database shards fails, which breaker trips first, and does it take the other 31 down with it?
+- How long does the biggest region take to fully reconnect under admission limits, and have you tested it?
 
 ---
 
@@ -2474,7 +2579,7 @@ flowchart TD
 
 *Cross-industry*
 
-## 4.1 Core Theory & Trade-offs
+## 4.1 Ideas & Trade-offs
 
 ### Sharding strategies
 
@@ -2492,25 +2597,27 @@ flowchart LR
 
 *[Open full-size diagram: Three ways to route a key to a shard (SVG)](diagrams/m4-three-ways-to-route-a-key-to-a-shard.svg)*
 
-| Strategy | How | Strengths | Weaknesses |
+**In plain words:** when data is too big or too busy for one database, you split it into **shards**. Each shard holds part of the data on its own machine. The big question is how to decide which shard each row belongs to.
+
+| Strategy | How | Good | Bad |
 |---|---|---|---|
-| **Range** | Contiguous key ranges per shard (Bigtable, HBase, CockroachDB, Spanner) | Efficient range scans. Ranges can be split and merged dynamically | Monotonic keys (timestamps, auto-increment IDs) create a single hot shard |
-| **Hash** | `shard = hash(key) mod N` | Even distribution | No range scans. **Changing N remaps nearly every key** |
-| **Consistent hash** | Keys and nodes on a hash ring | Adding or removing a node moves only ~1/N of keys | Placement is emergent, so it can't express policy |
-| **Directory / lookup** | An explicit `key → shard` table | Arbitrary placement: residency, noisy-neighbour isolation, one-tenant moves | Lookup is on the critical path (so cache it). The directory must be highly available |
-| **Geo / entity** | By region or tenant | Aligns with legal and organizational boundaries | Uneven sizes |
-| **Composite** | Directory to a cell, hash within the cell | Policy at the top, uniformity underneath | Two layers to operate |
+| **Range** | Each shard holds a range of keys (A–F, G–M…) | Fast range scans. Ranges can be split as they grow | Keys that always increase (timestamps, auto-increment IDs) all land on the last shard |
+| **Hash** | `shard = hash(key) mod N` | Spreads data evenly | No range scans. **Changing N moves almost every key** |
+| **Consistent hash** | Keys and servers placed on a ring | Adding or removing a server moves only about 1/N of keys | You can't choose where a specific key goes |
+| **Directory (lookup table)** | A table says which shard each key is on | Full control: keep data in the right country, move one busy customer | The lookup happens on every request (cache it). The table must always be available |
+| **By region or customer** | Split by country or tenant | Matches legal and business boundaries | Shards can be very different sizes |
+| **Mixed** | A directory picks the group, a hash picks the shard inside it | Rules at the top, even spread underneath | Two layers to manage |
 
-**Shard-key criteria**, in priority order:
+**How to choose a shard key**, most important first:
 
-1. It keeps the **dominant queries single-shard**.
-2. It spreads *load*, not just data. A tenant with 1% of rows can generate 30% of queries.
-3. It is high-cardinality and **immutable**. Changing a row's shard key is a cross-shard move.
-4. It aligns with **isolation boundaries** such as tenant or jurisdiction.
+1. The **most common queries** should need only **one shard**.
+2. It should spread the *load*, not just the data. A customer with 1% of the rows can make 30% of the queries.
+3. It should have many distinct values and **never change**. Changing a row's shard key means moving it to another shard.
+4. It should match **isolation boundaries**, such as customer or country.
 
-**The hidden cost is tail latency.** A scatter-gather query waits for its slowest shard. If each shard independently meets a 10 ms p99, then fanning out to 50 shards gives `P(all under p99) = 0.99⁵⁰ ≈ 0.61`. About **39% of queries** will see at least one p99-slow shard. Fan-out queries need hedged requests, partial results, or a separate read model built for the purpose.
+**The hidden cost: slow queries that touch every shard.** A query that asks all shards must wait for the slowest one. If each shard is fast 99% of the time, a query touching 50 shards is fast on all of them only `0.99⁵⁰ ≈ 61%` of the time, so **about 39% of these queries** hit at least one slow shard. Queries that fan out need tricks: sending a backup request, returning partial results, or a separate read model built for that query.
 
-Also budget for: cross-shard transactions (sagas, or 2PC inside a distributed SQL engine), global secondary indexes, global uniqueness constraints (email addresses across shards), and resharding.
+Also plan for: transactions across shards (sagas, or a distributed SQL database), indexes that cover all shards, uniqueness across shards (for example, unique email addresses), and moving data between shards.
 
 ### Consistent hashing
 
@@ -2526,22 +2633,22 @@ flowchart LR
 
 *[Open full-size diagram: Consistent hashing lookup with virtual nodes and replicas (SVG)](diagrams/m4-consistent-hashing-lookup-with-virtual-nodes-and-replicas.svg)*
 
-Place nodes and keys on a ring `[0, 2³²)` using a hash. Each key belongs to the first node **clockwise** from it. Adding a node takes over only the arc between it and its predecessor, so about `K/N` keys move instead of nearly all of them.
+**In plain words:** imagine a clock face. Servers and keys are both placed on it using a hash. Each key belongs to the next server **clockwise**. When a server is added, it takes over only the keys between itself and the server before it, about `K/N` keys, not nearly all of them.
 
-- **Virtual nodes** (100–256 tokens per physical node) smooth out an uneven ring. They allow **capacity weighting**: a bigger node gets more tokens. When a node fails, its load spreads across many survivors instead of landing entirely on its single clockwise neighbour.
-- **Replication:** store each key on the next R *distinct physical* nodes clockwise. This is the Dynamo "preference list".
+- **Virtual nodes:** each real server appears at 100–256 spots on the ring. This evens out the spread, lets bigger servers take more spots, and when a server dies its load spreads over many servers instead of landing on its one neighbour.
+- **Copies:** store each key on the next R *different real servers* clockwise. This is how Amazon's Dynamo did it.
 
-**Alternatives worth knowing:**
+**Other options worth knowing:**
 
-| Scheme | Lookup | Properties | Fit |
+| Method | Lookup cost | Properties | Best for |
 |---|---|---|---|
-| Ring + vnodes | O(log V) | Flexible membership, needs a token table | Dynamo-style stores, cache clusters |
-| **Rendezvous (HRW)** | O(N): `argmax hash(key, node)` | No ring, minimal disruption, trivial weighting | Tens to hundreds of nodes, CDN and cache selection |
-| **Jump consistent hash** | O(ln N), no memory | Perfectly even, but buckets can only be added or removed *at the end* | Numbered shards, not arbitrary nodes |
-| Bounded-load consistent hashing | O(log V) | Caps any node at (1+ε) × average load | Hot-key-prone caches and load balancers |
-| Maglev | O(1) table lookup | Fast, near-even, minimal disruption | L4 load balancers |
+| Ring + virtual nodes | Fast (a binary search) | Flexible membership. Needs a token table | Dynamo-style databases, cache clusters |
+| **Rendezvous (HRW)** | Checks every server: pick the highest `hash(key, server)` | No ring, little movement, easy weighting | Tens to hundreds of servers, CDNs, caches |
+| **Jump hash** | Very fast, no memory | Perfectly even, but you can only add or remove servers *at the end* | Numbered shards |
+| Bounded-load hashing | Fast | Caps each server at slightly above average load | Caches with hot keys, load balancers |
+| Maglev | A single table lookup | Fast, nearly even, little movement | Network load balancers |
 
-**When not to use consistent hashing:** when placement is **policy**. Data residency, "this tenant gets a dedicated database" and "move this noisy tenant off shard 7" are directory decisions. A hash function cannot express law.
+**When *not* to use consistent hashing:** when placement is a **rule**. "This customer's data must stay in Canada", "this customer gets its own database" and "move this noisy customer off shard 7" are lookup-table decisions. A hash function can't follow the law.
 
 ### Write-Ahead Logging (WAL)
 
@@ -2562,26 +2669,28 @@ flowchart LR
 
 *[Open full-size diagram: WAL durability and recovery (SVG)](diagrams/m4-wal-durability-and-recovery.svg)*
 
-**The WAL rule:** a log record describing a change must reach durable storage *before* the modified data page does, and *before* the commit is acknowledged.
+**In plain words:** before a database changes its main data, it first writes a note in a log file saying what it's about to change. If it crashes, it reads the log to finish or redo the changes. That's why a committed transaction survives a power cut.
 
-- Changes are applied to pages in the **buffer pool**, which makes them *dirty*. Dirty pages are flushed lazily by the background writer and by **checkpoints**.
-- A **checkpoint** records a *redo point*: all changes before it are safely in the data files.
-- **Crash recovery** replays WAL from the last redo point. For each record, the page is modified only if the on-disk page's **pageLSN is lower than the record's LSN**. This makes redo *idempotent* — the same idea as Module 1, at the storage-engine level.
-- ARIES-style engines (SQL Server, InnoDB) also run **undo** for uncommitted transactions. PostgreSQL is effectively **redo-only**: thanks to MVCC, an uncommitted transaction's tuples simply stay invisible because the commit log never marks it committed.
+**The WAL rule:** the log entry must be safely on disk *before* the changed data page is written, and *before* the database tells the client "committed".
 
-**Why WAL is fast:** it turns random page writes into **sequential appends**. **Group commit** amortizes one `fsync` across many concurrent transactions.
+- Changes are first made to data pages in memory (the **buffer pool**), which marks those pages *dirty*. Dirty pages are written to disk later, in the background and during **checkpoints**.
+- A **checkpoint** records a safe point: everything before it is in the data files.
+- **Crash recovery** replays the log from the last checkpoint. A page is changed only if its stored log number (pageLSN) is **lower** than the log entry's number. So replaying twice is harmless: recovery is *idempotent*, the same idea as in Module 1.
+- Some databases (SQL Server, MySQL InnoDB) also **undo** unfinished transactions. PostgreSQL doesn't need to: unfinished transactions are simply never marked as committed, so their rows stay invisible (thanks to MVCC).
 
-**Knobs and their trade-offs (PostgreSQL):**
+**Why it's fast:** adding to the end of a log file is much faster than writing pages all over the disk. **Group commit** saves many transactions with one disk sync.
+
+**PostgreSQL settings and their trade-offs:**
 
 | Setting | Effect | Risk |
 |---|---|---|
-| `synchronous_commit = off` | Acknowledges before the WAL flush, giving much higher throughput | Loses the last few hundred ms of acknowledged transactions on crash. **No corruption**, but RPO > 0 |
-| `full_page_writes = on` | Writes a full page image on the first change after a checkpoint | Protects against torn pages. Increases WAL volume |
-| Frequent checkpoints | Fast recovery | More I/O and more full-page images |
-| Infrequent checkpoints | Less I/O | Longer crash recovery (the RTO grows) |
-| `synchronous_standby_names = 'ANY 1 (s1, s2)'` | Quorum synchronous replication | Commit latency includes the standby's flush, but one standby can fail without blocking commits |
+| `synchronous_commit = off` | Replies "committed" before the log is on disk. Much faster | A crash loses the last few hundred ms of "committed" transactions. **No corruption**, but some data loss |
+| `full_page_writes = on` | Writes a full page copy the first time a page changes after a checkpoint | Protects against half-written pages. Bigger log |
+| Frequent checkpoints | Faster recovery | More disk work |
+| Rare checkpoints | Less disk work | Slower recovery after a crash |
+| `synchronous_standby_names = 'ANY 1 (s1, s2)'` | Waits for one of two standbys to confirm | Commits wait for a standby, but one standby can fail without blocking |
 
-**WAL is also the replication stream.** Physical streaming replication ships WAL to standbys. **Logical decoding** turns it into change events for CDC (Debezium), which is exactly the outbox relay from Module 1. The pattern generalizes: in Kafka, "the log *is* the database", and tables are its cached projections. LSM-tree engines (RocksDB, Cassandra) follow the same order: WAL, then memtable, then immutable SSTables, then compaction.
+**The WAL is also how replicas stay updated.** Streaming replication sends the WAL to standby servers. **Logical decoding** turns it into change events for CDC tools (Debezium). That's exactly the outbox relay from Module 1. The general idea: "the log *is* the database", and tables are just a cached result of it. Write-optimized databases (RocksDB, Cassandra) follow the same order: log first, then memory, then files on disk.
 
 ### Read replicas vs. multi-primary replication
 
@@ -2610,21 +2719,21 @@ flowchart LR
 
 *[Open full-size diagram: Single primary vs multi-primary replication (SVG)](diagrams/m4-single-primary-vs-multi-primary-replication.svg)*
 
-| Model | Writes | Reads | Conflicts | Failure behaviour |
+| Model | Writes | Reads | Conflicts | When things fail |
 |---|---|---|---|---|
-| Single primary + **async** replicas | One node | Scale out, but stale | None | Failover can lose acknowledged writes (RPO > 0) |
-| Single primary + **sync/quorum** replicas | One node + standby ack | Scale out | None | RPO 0. Commit latency includes a standby round trip |
-| **Multi-primary** (e.g. bidirectional logical replication, Cosmos DB multi-region writes) | Many nodes or regions | Local | **Inevitable** under concurrency: LWW, merge functions, CRDTs | Writes stay available during a partition, and state diverges |
-| **Consensus-replicated** (Spanner, CockroachDB) | Per-range Raft leader | Leader, or follower reads with bounded staleness | Prevented by consensus | Needs a majority. Pays cross-region RTT |
+| One primary + **async** replicas | One server | Many servers, slightly behind | None | Failover can lose recently confirmed writes |
+| One primary + **sync** replicas | One server + a standby confirmation | Many servers | None | No data loss. Each commit waits for the standby |
+| **Multi-primary** (several servers or regions accept writes) | Many | Local | **Will happen**. Need a rule: newest wins, merge, or CRDTs | Keeps accepting writes during a split, and data drifts apart |
+| **Consensus-based** (Spanner, CockroachDB) | One leader per data range | Leader, or followers with a known delay | Prevented | Needs a majority. Slower across regions |
 
-**Replica read anomalies and fixes:**
+**Common replica problems and fixes:**
 
-- **Read-your-writes:** return the commit LSN from the write. Read from a replica only if `pg_last_wal_replay_lsn() >= lsn`, otherwise use the primary.
-- **Monotonic reads:** pin a session to one replica, or carry the highest LSN seen so far.
+- **Not seeing your own write:** after writing, remember the database log position. Read from a replica only if it has caught up to that position (`pg_last_wal_replay_lsn()`), otherwise read from the primary.
+- **Going back in time:** keep a user on one replica, or remember the newest position they've seen.
 
-**Principal heuristic:** *multi-primary is a conflict-resolution strategy wearing an availability costume.* Last-writer-wins silently discards data and depends on clocks. Prefer **single writer per partition** (each tenant or row has a home) with fast failover. Reserve multi-primary for data with natural merge semantics: counters, sets, presence, carts.
+**Rule of thumb:** *multi-primary sounds like "always available", but it's really a conflict-resolution problem.* "Newest write wins" quietly throws away data and depends on clocks. Prefer **one writer per piece of data** (each customer or row has a home), with fast failover. Use multi-primary only for data that merges naturally: counters, sets, online status, shopping carts.
 
-## 4.2 Python in Practice: Tenant-Aware Routing in SQLAlchemy (and Django)
+## 4.2 Python: Routing Each Customer to the Right Database in SQLAlchemy (and Django)
 
 ```mermaid
 flowchart LR
@@ -2644,13 +2753,13 @@ flowchart LR
 
 *[Open full-size diagram: Tenant-aware request routing (SVG)](diagrams/m4-tenant-aware-request-routing.svg)*
 
-The routing design has five parts:
+How the routing works:
 
-1. **Resolve placement once per request**, asynchronously, from a cached tenant directory.
-2. **Pin placement to the session.** Don't re-read ambient state inside `get_bind`, where a background task could change it mid-session.
-3. **Refuse cross-region access** at the application layer.
-4. **Enforce isolation in the database** with row-level security as defense in depth.
-5. **Split reads and writes** where replicas exist.
+1. **Look up where the customer's data lives, once per request**, from a cached tenant directory.
+2. **Save that location on the session**, so a background task can't accidentally change it halfway through.
+3. **Refuse to read another region's data** in the application.
+4. **Let the database enforce isolation too**, with row-level security, as a second safety net.
+5. **Send reads and writes to different servers** where replicas exist.
 
 ```python
 from __future__ import annotations
@@ -2746,7 +2855,7 @@ async def tenant_session(
         yield session
 ```
 
-Database-side isolation, in case the application layer ever gets it wrong:
+Database-side safety net, in case the app ever gets it wrong:
 
 ```sql
 ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
@@ -2757,11 +2866,11 @@ CREATE POLICY tenant_isolation ON invoices
 -- The application role must NOT be a superuser and must NOT have BYPASSRLS.
 ```
 
-Trade-offs to state out loud:
+Trade-offs to say out loud:
 
-- For a single-tenant, request-scoped session, binding the `AsyncSession` directly to the right engine is simpler than overriding `get_bind`. The override earns its place when one session spans **several binds**: reference data versus tenant data, or reads versus writes.
-- Read/write splitting by HTTP method is coarse. A `GET` immediately after a `POST` can read a lagging replica. Carry the commit LSN in a cookie or header and fall back to the primary when the replica is behind.
-- **Django equivalent:** a database router with `db_for_read` and `db_for_write` that reads the tenant from a `contextvars.ContextVar` set by middleware, plus `DATABASES` entries registered per shard at startup. The same rules apply to RLS and wrong-region checks.
+- For a simple one-customer-per-request session, binding the session directly to the right engine is simpler than overriding `get_bind`. The override is worth it when one session uses **several databases**: shared reference data plus customer data, or reads plus writes.
+- Choosing replica vs. primary by HTTP method is rough. A `GET` right after a `POST` may read a replica that's behind. Send the commit position in a cookie or header, and use the primary if the replica hasn't caught up.
+- **In Django:** a database router with `db_for_read` and `db_for_write` that reads the current customer from a `contextvars.ContextVar` set by middleware, plus one `DATABASES` entry per shard. The same row-level security and region checks apply.
 
 ## 4.3 Case Study: A Multi-Tenant B2B SaaS Platform with Data Residency
 
@@ -2784,54 +2893,54 @@ flowchart TB
 
 **Requirements:**
 
-- About 4,000 tenants, ranging from 20-seat SMBs to 50,000-seat enterprises (**a 1,000× size spread**).
-- EU tenants' data stays in the EU. Canadian public-sector tenants stay in Canada. Everyone else is served from the US.
-- Enterprise contracts demand optional dedicated databases and customer-managed keys.
-- Horizontal scale, zero-downtime tenant moves, and per-tenant restore.
+- About 4,000 customers, from 20-person companies to 50,000-person enterprises. That's **1,000 times** difference in size.
+- EU customers' data must stay in the EU, Canadian public-sector data in Canada, and everyone else's in the US.
+- Enterprise contracts can require a dedicated database and encryption keys the customer controls.
+- It must grow by adding machines, move a customer without downtime, and restore one customer's data on its own.
 
-### Architecture decisions
+### Design decisions
 
-**1. Global control plane, regional data planes.** The global plane stores only tenant *metadata*: tenant ID, region, cell, plan, residency tag and epoch. It holds no customer content, which is what makes it legally global. It is replicated read-mostly across regions and cached at the edge.
+**1. One global control system, separate regional data systems.** The global part stores only *information about* customers: ID, region, cell, plan, residency rule and epoch. It stores **no customer content**, which is why it's allowed to be global. It's copied to every region and cached at the edge.
 
-**2. Cells within each region.** A cell is an app tier plus a set of PostgreSQL shards, cache, queue and blob storage. Cells are capped (for example, 500 tenants or 20 TB) so a bad deploy or runaway query has a bounded blast radius. New capacity means new cells, not bigger ones.
+**2. Cells inside each region.** A cell is a complete set: app servers, several PostgreSQL shards, a cache, a queue and file storage. Each cell has a size limit (say 500 customers or 20 TB), so a bad deploy or runaway query affects only that cell. To grow, you add cells, not bigger cells.
 
-**3. Isolation tiers:**
+**3. Isolation levels:**
 
-| Tier | Model | Tenant profile | Trade-offs |
+| Level | How | For | Trade-offs |
 |---|---|---|---|
-| **Pool** | Shared tables + `tenant_id` + RLS | SMB (the vast majority) | Cheapest, densest. Noisy-neighbour risk. Per-tenant restore is hard |
-| **Bridge** | Schema per tenant | Mid-market | Easier per-tenant export. Catalog bloat and migration fan-out at thousands of schemas |
-| **Silo** | Dedicated database or server, customer-managed key via Key Vault | Enterprise and regulated | Strongest isolation and a simple per-tenant restore. Most expensive, and fleet upgrades are harder |
+| **Pool** | Shared tables with a `tenant_id` column and row-level security | Small customers (most of them) | Cheapest and densest. Noisy neighbours are possible. Restoring one customer is hard |
+| **Bridge** | A separate schema per customer | Mid-size | Easier to export one customer. Gets unwieldy with thousands of schemas |
+| **Silo** | A dedicated database or server, with the customer's own key in Key Vault | Enterprise and regulated customers | Strongest isolation and easy restores. Most expensive, and harder to upgrade everywhere |
 
-**4. Placement uses the directory, not consistent hashing.** With a 1,000× size spread, hash placement guarantees some shards hold three enterprise tenants while others idle. Placement is **bin-packing by observed load**, with residency as a hard constraint. Consistent hashing still has a job *inside* the stack: distributing cache keys across a Redis cluster, and partitioning a single giant tenant's event tables.
+**4. Use the lookup table, not consistent hashing, to place customers.** With 1,000× size differences, hashing would put three giants on one shard while others sit idle. Placement is **packing by actual load**, with residency as a strict rule. Consistent hashing still has jobs *inside* the system: spreading cache keys across Redis, and splitting one giant customer's event tables.
 
-**5. Routing and residency enforcement.**
+**5. Routing and keeping data in its country:**
 
-- Tenant subdomains (`acme.app.example`) resolve at the edge to the tenant's region using the cached directory.
-- A request that lands in the wrong region gets a **redirect**, never a cross-region data fetch.
-- Whether transient in-transit processing is acceptable is a legal question for counsel. Design so that **data at rest never leaves the region**, and so that the application refuses cross-region reads by default (the `WrongRegionError` above).
+- Customer subdomains (`acme.app.example`) are sent to the right region at the edge, using the cached directory.
+- A request that reaches the wrong region gets a **redirect**, never a cross-region data fetch.
+- Whether data may briefly pass through another country is a legal question for your lawyers. Design so that **stored data never leaves its region**, and the app refuses cross-region reads by default (the `WrongRegionError` in the code above).
 
-**6. Zero-downtime tenant moves (pool → silo, or cell → cell):**
+**6. Moving a customer without downtime** (from pool to silo, or between cells):
 
-1. Snapshot, then run a CDC or logical-replication stream of that tenant's rows to the target.
-2. Verify with row counts and checksums per table.
-3. Freeze writes briefly (typically seconds). Drain in-flight transactions and let CDC catch up.
-4. **Flip the directory entry and increment the epoch.** Writers holding the old epoch are rejected: fencing once again.
-5. Invalidate caches keyed by epoch, keep the old copy read-only for a grace period, then purge it and record the purge for audit.
+1. Copy a snapshot, then stream that customer's ongoing changes to the new location.
+2. Check that row counts and checksums match for each table.
+3. Pause the customer's writes briefly (usually seconds), and let the change stream catch up.
+4. **Switch the directory entry and increase the epoch.** Writers still using the old epoch are rejected. That's fencing again.
+5. Clear caches, keep the old copy read-only for a while, then delete it and record the deletion for auditors.
 
-**7. Noisy-neighbour controls:** per-tenant rate limits at the gateway, `statement_timeout` per role, PgBouncer pools per tier, and a query-cost budget. Tenants that keep breaching are *moved*, not throttled forever. Being able to move a tenant is the real scalability feature.
+**7. Noisy neighbour controls:** per-customer rate limits, query time limits (`statement_timeout`), connection limits per tier (PgBouncer), and query cost budgets. Customers who keep breaking limits are *moved*, not throttled forever. Being able to move customers is the real scaling feature.
 
 **8. Operational realities:**
 
-- **Schema migrations across ~300 shards** use expand/contract, applied in waves (canary cell first), with a per-shard migration version table. Never run "one big migration".
-- **Per-tenant restore in the pool tier:** point-in-time recovery restores a whole database. Restore to a side instance, extract the tenant's rows by `tenant_id`, and merge them back. This is slow, so sell faster restore as part of the silo tier.
-- **Analytics** run in a per-region lakehouse. Cross-region reporting uses only aggregated, de-identified data.
+- **Schema changes across ~300 shards:** add the new structure first and remove the old one later (expand/contract), in waves (a test cell first), with a migration version table per shard. Never run one big migration.
+- **Restoring one customer in the pool tier:** point-in-time recovery restores the whole database. So restore to a side server, copy out that customer's rows, and merge them back. It's slow, which is a good reason to sell faster restores with the silo tier.
+- **Reports** run in a data lake per region. Reports across regions use only totals, with nothing that identifies a person.
 
-**Azure mapping:** Front Door for global routing. Azure Database for PostgreSQL Flexible Server per shard or silo (zone-redundant HA). Key Vault Managed HSM for customer-managed keys. Azure Policy to deny resource creation outside the allowed regions per subscription (a guardrail that holds even when code is wrong). One subscription or management group per regional stamp.
+**Azure services:** Front Door for global routing. Azure Database for PostgreSQL Flexible Server per shard or silo (zone-redundant HA). Key Vault Managed HSM for customer-controlled keys. Azure Policy to block creating resources outside the allowed regions (a safety net that works even when code is wrong). One subscription or management group per region.
 
-## 4.4 Mermaid: Consistent Hashing Ring — Adding and Removing Nodes
+## 4.4 Diagram: Consistent Hashing Ring — Adding and Removing Nodes
 
-Ring positions run 0–359, and each key belongs to the first node clockwise from it.
+Ring positions run from 0 to 359, and each key belongs to the next server clockwise.
 
 ```mermaid
 flowchart LR
@@ -2881,9 +2990,9 @@ flowchart LR
 
 *[Open full-size diagram: Consistent hashing ring - adding and removing nodes (SVG)](diagrams/m4-consistent-hashing-ring-adding-and-removing-nodes.svg)*
 
-With modulo hashing (`hash mod N`), going from 3 to 4 nodes remaps about 75% of keys. Here, one key in four moves in each step. With virtual nodes, the removed node's range would be spread across many successors instead of all falling on A.
+With `hash mod N`, going from 3 to 4 servers moves about 75% of keys. Here, only one key in four moves at each step. With virtual nodes, a removed server's keys would be spread over many servers instead of all going to A.
 
-The WAL commit path, for reference alongside the animation below:
+The WAL write path, to go with the animation below:
 
 ```mermaid
 sequenceDiagram
@@ -2913,43 +3022,43 @@ sequenceDiagram
 
 *[Open full-size diagram: WAL commit path (SVG)](diagrams/m4-wal-commit-path.svg)*
 
-## 4.5 Animation Blueprint: A Write Updating the WAL Before the Main Database State
+## 4.5 Animation Plan: A Write Saved to the WAL Before the Main Data
 
-**Scene layout (a 2D `Scene` at 1920×1080):**
+**Scene (2D, 1920×1080):**
 
-- **Left:** *Client*, plus two ghost clients that appear later to show group commit.
+- **Left:** a *Client*, plus two faint extra clients that appear later to show group commit.
 - **Centre:** the *Postgres backend* process box.
 - **Top centre:** a grid of 16 page tiles labelled *Shared buffers (RAM)*.
-- **Right centre:** a horizontal *WAL buffer* strip.
-- **Bottom right:** *WAL on disk*, drawn as a tape with LSN tick marks.
-- **Bottom left:** *Heap data files on disk*, a grid mirroring the RAM tiles.
+- **Right centre:** a *WAL buffer* strip.
+- **Bottom right:** *WAL on disk*, drawn as a tape with log number (LSN) marks.
+- **Bottom left:** *Data files on disk*, a grid matching the RAM tiles.
 - **Top right:** an LSN counter.
-- **Far right, faded:** a *Sync standby*, used in the final act.
+- **Far right, faded:** a *Sync standby*, used at the end.
 
-| Time | Beat | Visual | Manim primitives |
+| Time | Step | What you see | Manim tools |
 |---|---|---|---|
-| 0:00–0:03 | **Request** | A SQL card `UPDATE accounts SET balance=80 WHERE id=7` slides from Client to the backend | `MoveToTarget`, `Write` |
-| 0:03–0:06 | **Locate page** | Heap tile 42 glows. A copy flies up into the RAM grid (a cache miss). Its label reads `balance=100, pageLSN=0/16B3E80` | `TransformFromCopy`, `Indicate` |
-| 0:06–0:10 | **Generate WAL** | A WAL record block `LSN 0/16B3F20: heap update p42 s3` materializes *first* and slides into the WAL buffer. The LSN counter ticks | `FadeIn(shift=RIGHT)`, `ChangeDecimalToValue` |
-| 0:10–0:13 | **Modify in memory** | The RAM tile updates to `balance=80`, turns orange (*dirty*) and is re-stamped `pageLSN=0/16B3F20`. A padlock icon with a thin line ties the tile to the WAL record. Caption: *This page may not reach disk until the WAL up to its LSN does* | `Transform`, `set_fill(ORANGE)`, `Line` |
-| 0:13–0:16 | **COMMIT** | The client sends `COMMIT`. A commit record joins the buffer. Two ghost clients add their own commit records alongside it | `LaggedStart(FadeIn)` |
-| 0:16–0:20 | **Group commit fsync** | The three records slide as one group onto the disk tape. A single **fsync** flash fires and a disk LED blinks once. Caption: *One fsync, three durable commits* | `AnimationGroup`, `Flash`, `ShowPassingFlash` along the tape |
-| 0:20–0:23 | **Acknowledge** | `COMMIT OK` returns to all three clients. The heap tile at bottom left **still shows `balance=100`**. Caption: *Durable is not the same as written to the data file* | `Indicate(heap_tile, color=YELLOW)` |
-| 0:23–0:28 | **Checkpoint** (fast-forward) | A clock spins. The checkpointer sweeps the RAM grid, dirty tiles flow down into the heap grid (random writes, drawn as scattered arrows) and turn white. A `CHECKPOINT redo=…` marker drops onto the WAL tape | `Rotate(clock_hand)`, `LaggedStart(TransformFromCopy)` |
-| 0:28–0:30 | **Rewind** | Rewind to 0:23 (after the ack, before the checkpoint) | Reverse `ValueTracker` or `Restore` |
-| 0:30–0:33 | **Crash** | A lightning bolt strikes. The RAM grid shatters into fragments and fades: *shared buffers lost*. The disk tape and the heap survive | `Create(lightning)`, `ShrinkToCenter` on fragments |
-| 0:33–0:40 | **Redo recovery** | A *startup process* cursor jumps to the last checkpoint's redo point on the tape and scans forward. At record `0/16B3F20`, it looks up heap page 42 and shows a comparison bubble: `pageLSN 0/16B3E80 < 0/16B3F20 → REPLAY`. The page reloads into RAM and becomes `balance=80`. A second record whose page is already newer shows `pageLSN ≥ record LSN → SKIP` | `MoveAlongPath(cursor)`, comparison `MathTex`, `Transform` |
-| 0:40–0:44 | **Uncommitted work** | A third, uncommitted transaction's record is also replayed, but the commit-log (CLOG) panel marks it *in progress → aborted*, so its tuple renders greyed-out and invisible. Caption: *PostgreSQL needs no undo: MVCC hides it* | `set_opacity(0.25)`, CLOG `Table` update |
-| 0:44–0:52 | **Replication** (bonus) | Replay the commit with the standby lit. The WAL stream flows to the standby's own tape, and the client's `COMMIT OK` arrow waits at a gate until the standby's `flushed up to Y` ack returns. A latency meter shows the extra RTT | `ShowPassingFlash`, gate `Rectangle` sliding open |
-| 0:52–0:56 | **Recap** | Three stacked rules: *1. Log before data. 2. Flush log before ack. 3. Redo is idempotent via pageLSN* | `Write`, `LaggedStart` |
+| 0:00–0:03 | **Request** | A card saying `UPDATE accounts SET balance=80 WHERE id=7` slides from Client to the backend | `MoveToTarget`, `Write` |
+| 0:03–0:06 | **Find the page** | Disk tile 42 glows, and a copy flies up into RAM (it wasn't cached). It shows `balance=100, pageLSN=0/16B3E80` | `TransformFromCopy`, `Indicate` |
+| 0:06–0:10 | **Write the log entry first** | A log block `LSN 0/16B3F20: update page 42 slot 3` appears *first* and slides into the WAL buffer. The LSN counter goes up | `FadeIn`, counter change |
+| 0:10–0:13 | **Change the page in memory** | The RAM tile changes to `balance=80`, turns orange (*dirty*) and is stamped `pageLSN=0/16B3F20`. A padlock links it to the log entry. Caption: *This page can't go to disk until its log entry does* | `Transform`, orange fill, `Line` |
+| 0:13–0:16 | **COMMIT** | The client sends `COMMIT` and a commit entry joins the buffer. The two extra clients add their own commit entries alongside | `LaggedStart(FadeIn)` |
+| 0:16–0:20 | **One disk sync for all three** | The three entries slide together onto the disk tape, one **fsync** flash fires, and a disk light blinks once. Caption: *One sync, three safe commits* | `AnimationGroup`, `Flash` |
+| 0:20–0:23 | **Reply** | `COMMIT OK` goes back to all three clients. The disk tile at bottom left **still says `balance=100`**. Caption: *Safe doesn't mean written to the data file yet* | Yellow `Indicate` on the disk tile |
+| 0:23–0:28 | **Checkpoint** (fast forward) | A clock spins. The checkpointer sweeps the RAM grid, dirty tiles flow down to the disk grid (scattered arrows) and turn white. A `CHECKPOINT` marker drops onto the tape | Rotating hand, `LaggedStart` |
+| 0:28–0:30 | **Rewind** | Rewind to 0:23 (after the reply, before the checkpoint) | `Restore` |
+| 0:30–0:33 | **Crash** | Lightning strikes. The RAM grid shatters and fades: *memory lost*. The disk tape and data files survive | Lightning, shrinking fragments |
+| 0:33–0:40 | **Recovery** | A cursor jumps to the last checkpoint on the tape and moves forward. At entry `0/16B3F20` it checks disk page 42: `pageLSN 0/16B3E80 < 0/16B3F20 → REPLAY`. The page reloads and becomes `balance=80`. Another entry, whose page is already newer, shows `→ SKIP` | Moving cursor, comparison text, `Transform` |
+| 0:40–0:44 | **Unfinished work** | A third, uncommitted transaction's entry is replayed too, but the commit-status panel shows it was never committed. Its row appears greyed out and invisible. Caption: *PostgreSQL needs no undo step: MVCC hides it* | Low opacity, status table update |
+| 0:44–0:52 | **Replica** (bonus) | Replay the commit with the standby shown. The log flows to the standby's tape, and the client's `COMMIT OK` waits at a gate until the standby confirms. A meter shows the extra wait | `ShowPassingFlash`, sliding gate |
+| 0:52–0:56 | **Summary** | Three rules: *1. Log before data. 2. Save the log before replying. 3. Replay is safe to repeat, thanks to pageLSN* | `Write`, `LaggedStart` |
 
-## 4.6 Staff-level Review Questions
+## 4.6 Review Questions
 
-- Which queries fan out across shards, and what is their p99 under a single slow shard?
-- Can we move one tenant between cells today, and how long is the write freeze?
-- What prevents a request in the EU region from reading a Canadian tenant's rows: code, the network, policy, or all three?
-- What is our actual RPO, for each database, under the current `synchronous_commit` and standby configuration?
-- If the tenant directory is unavailable for 10 minutes, what still works?
+- Which queries touch every shard, and how slow are they when one shard is slow?
+- Can we move one customer between cells today? How long are their writes paused?
+- What stops a request in the EU region from reading a Canadian customer's data: code, the network, cloud policy, or all three?
+- For each database, how much data could we actually lose with the current commit and standby settings?
+- If the customer directory is down for 10 minutes, what still works?
 
 ---
 
@@ -2957,7 +3066,7 @@ sequenceDiagram
 
 *Industry: Card Issuing, Payments & Retail Banking*
 
-## 5.1 Core Theory & Trade-offs
+## 5.1 Ideas & Trade-offs
 
 ### Stream processing fundamentals
 
@@ -2977,44 +3086,51 @@ flowchart LR
 
 *[Open full-size diagram: Event-time stream processing (SVG)](diagrams/m5-event-time-stream-processing.svg)*
 
-**Event time vs. processing time.** *Event time* is when the card was swiped. *Processing time* is when your operator sees the event. They diverge because of network delay, retries, mobile devices that were offline, and partition rebalances. Fraud features must be computed on **event time**. Otherwise a burst that arrives late looks spread out, and a backlog replay looks like a burst.
+**In plain words:** stream processing means working on data *while it flows*, one event at a time, instead of waiting to process a big batch later.
 
-**Watermarks** are the stream's estimate that "no events older than T are still coming". They trade **latency against completeness**:
+**Event time vs. processing time:**
 
-- An *aggressive* watermark (small allowed delay) emits results quickly and drops or mishandles more late events.
-- A *conservative* watermark is more complete but slower.
-- Events that arrive after the watermark go to an **allowed-lateness** path, which updates and re-emits the window, or to a side output for correction.
+- *Event time* is when something actually happened, such as when the card was tapped.
+- *Processing time* is when your program sees it.
 
-**Windows:**
+The two differ because of network delays, retries, phones that were offline, and system restarts. Fraud checks must use **event time**. Otherwise a burst that arrives late looks spread out, and a backlog being replayed looks like a burst.
 
-| Window | Shape | Fraud use |
+**Watermarks** are the stream's best guess that "no events older than time T are still coming". They trade **speed against completeness**:
+
+- An *eager* watermark gives quick results but misses more late events.
+- A *patient* watermark is more complete but slower.
+- Events that arrive after the watermark can update the result (**allowed lateness**) or go to a separate "late" output for correction.
+
+**Windows** group events by time:
+
+| Window | Shape | Fraud example |
 |---|---|---|
-| Tumbling | Fixed and non-overlapping (e.g. every 1 min) | Merchant-level dashboards, simple rate alarms |
-| Hopping / sliding | Fixed length that advances by a smaller step (10 min every 30 s) | Velocity: "auths per card in the last 10 minutes" |
-| Session | Closes after a gap of inactivity | Device or online-banking session behaviour, account-takeover patterns |
-| Global + custom trigger | Unbounded, emitted on conditions | Rules like "first transaction in a new country since 90 days" |
+| Tumbling | Fixed blocks that don't overlap (every 1 min) | Merchant dashboards, simple rate alarms |
+| Sliding / hopping | A fixed length that moves forward in small steps (last 10 min, updated every 30 s) | "How many times was this card used in the last 10 minutes?" |
+| Session | Ends after a period of no activity | Online-banking sessions, account-takeover patterns |
+| Global + custom trigger | Never ends. Fires when a condition is met | "First purchase in a new country in 90 days" |
 
-**State and fault tolerance.**
+**Remembering things between events (state):**
 
-- Streaming aggregations are *stateful* (counts per card, last country seen, distinct merchants). The state lives in a keyed state backend such as RocksDB in Flink or Kafka Streams.
-- It is made fault-tolerant by **periodic checkpoints**. Flink uses asynchronous barrier snapshots, a variant of Chandy–Lamport, that record operator state and source offsets consistently.
-- Recovery rewinds sources to the checkpointed offsets and restores state. The *effect* is exactly-once **for state inside the engine**.
+- Counting per card, remembering the last country and so on needs **state**. It's kept in a local database inside the stream engine (such as RocksDB in Flink or Kafka Streams).
+- The engine regularly saves **checkpoints** of that state together with its position in the input.
+- After a crash, it goes back to the checkpoint and continues. The *effect* is "exactly once" **for data inside the engine**.
 
-**Exactly-once, precisely:**
+**What "exactly once" really covers:**
 
-- **Kafka transactions** (idempotent producer + `transactional.id` + `sendOffsetsToTransaction` + consumers reading `read_committed`) make a consume–transform–produce loop atomic: output records and input offsets commit together or not at all.
-- **Flink** extends this to sinks using two-phase-commit sink connectors.
-- **Anything outside that boundary is still at-least-once**: a Redis feature store, a REST call to case management, an SMS alert. The rule from Module 1 applies: make those writes idempotent by event ID.
+- **Kafka transactions** (idempotent producer + `transactional.id` + `sendOffsetsToTransaction` + consumers reading `read_committed`) make "read, process, write" one all-or-nothing step: outputs and input positions are saved together or not at all.
+- **Flink** extends this to some outputs with two-phase commit.
+- **Anything outside that is still "at least once"**: a Redis feature store, a REST call, an SMS. The rule from Module 1 applies: make those writes safe to repeat, using the event ID.
 
-**Kappa vs. Lambda:**
+**Two ways to build the data platform:**
 
 | | Lambda | Kappa |
 |---|---|---|
-| Paths | Batch layer (complete, slow) + speed layer (fast, approximate) | A single streaming path. Reprocess by replaying the log |
-| Cost | Two codebases computing "the same" feature, which *will* drift | One codebase. Replay needs long log retention or a lakehouse source |
-| Modern form | Mostly retired | Streaming + lakehouse (Delta/Iceberg) as replayable history |
+| Paths | A batch path (complete, slow) plus a fast path (quick, approximate) | Only a streaming path. To reprocess, replay the log |
+| Cost | Two codebases computing "the same" number, which *will* drift apart | One codebase. Needs a long log or a data lake to replay from |
+| Today | Mostly replaced | Streaming plus a data lake (Delta/Iceberg) as replayable history |
 
-For fraud, the pragmatic answer is **Kappa for features, with batch for model training and graph analytics**, plus one feature definition compiled to both paths (see training–serving skew below).
+For fraud, the practical answer is **Kappa for features, batch for model training and graph analysis**, with one shared definition for each feature (see "training/serving mismatch" below).
 
 ### Fraud detection architecture: three latency tiers
 
@@ -3033,13 +3149,13 @@ flowchart LR
 
 *[Open full-size diagram: Three latency tiers of fraud detection (SVG)](diagrams/m5-three-latency-tiers-of-fraud-detection.svg)*
 
-| Tier | Latency budget | Examples | Where it runs |
+| Tier | Time budget | Examples | Where it runs |
 |---|---|---|---|
-| **Inline (synchronous)** | Tens of ms, inside the card network's authorization timeout | Approve / step-up / decline on a card authorization or instant payment | Scoring service in the auth path |
-| **Near-real-time** | Seconds to minutes | Card-testing attack on a merchant, account-takeover sequences, mule-account inflows, customer alerts | Stream processor → alerts / feature store |
-| **Batch** | Hours to days | Graph analysis of mule rings, model training, AML typologies, back-testing rules | Lakehouse, graph engine |
+| **Inline (while the payment waits)** | Tens of ms, inside the card network's time limit | Approve / extra check / decline a card payment or instant transfer | A scoring service in the payment path |
+| **Near real time** | Seconds to minutes | Attacks on a merchant, account takeover, money-mule deposits, customer alerts | Stream processor → alerts and feature store |
+| **Batch** | Hours to days | Finding mule rings with graph analysis, training models, anti-money-laundering (AML) patterns, testing rules | Data lake, graph engine |
 
-**The central design constraint:** the inline path **cannot wait** for a stream aggregation. It reads **precomputed features** from a low-latency online feature store, and combines them with **request-time features** computed from the authorization itself.
+**The key design limit:** the inline check **can't wait** for the stream to finish counting. It reads **ready-made features** from a fast **online feature store**, and adds features calculated from the payment request itself.
 
 ### Features, and the traps around them
 
@@ -3059,22 +3175,28 @@ flowchart LR
 
 *[Open full-size diagram: Feature freshness classes (SVG)](diagrams/m5-feature-freshness-classes.svg)*
 
-- **Velocity:** counts and sums over sliding windows per entity: card, account, device, IP, merchant, and card-plus-merchant pairs.
-- **Distinct counts:** distinct merchants or countries per card in 24 h. At scale, use HyperLogLog with its approximation error stated.
-- **Behavioural baselines:** typical amount, usual merchant categories, usual hours, home country. Expressed as deviations (z-scores), not raw values.
-- **Geo-velocity ("impossible travel"):** the distance between consecutive card-present locations divided by the time between them.
-- **Graph features:** shared devices, shared payees, and fan-in to newly opened accounts (mule signals). Usually computed in batch and published to the online store.
+**Features** are the numbers the model uses to judge a payment:
 
-**Freshness gap.** A card-testing script can fire 50 authorizations in 2 seconds. If your stream processor's end-to-end lag is 1–3 seconds, stream-computed velocity features are *blind* to exactly the burst you care about. **Principal answer:** maintain the *short-window* counters **inline**, as an atomic read-and-increment in the authorization path. Let the stream compute the heavier windows, baselines and cross-entity aggregates.
+- **Velocity:** counts and totals over recent time windows, per card, account, device, IP address, merchant, and card + merchant pair.
+- **Distinct counts:** how many different merchants or countries a card used in 24 h. At scale, use HyperLogLog, an approximate counter, and state its error margin.
+- **Normal behaviour:** typical amount, usual shop types, usual hours, home country. Expressed as "how unusual is this?" rather than raw values.
+- **Impossible travel:** the distance between two in-person purchases divided by the time between them.
+- **Relationship features:** shared devices, shared payees, many new accounts sending money to one place (mule signs). Usually calculated in batch and copied to the online store.
 
-**Training–serving skew.** A feature computed one way in Python notebooks for training and another way in the stream for serving will silently diverge, and model performance will quietly decay. Mitigations:
+**The freshness gap.** A bot testing stolen cards can make 50 payments in 2 seconds. If the stream processor is 1–3 seconds behind, its counters **can't see** exactly the burst you care about. **The fix:** keep the *short-window* counters **inside the payment path**, as one atomic "add and read" step. Let the stream handle the heavier features.
 
-- Define features once, in a feature platform or a shared library, and generate both the offline and online computations from that definition.
-- Log the **features as served** at decision time, and train on those logs.
+**Training/serving mismatch.** If a feature is calculated one way in the notebook used for training and another way in the live stream, the two slowly drift apart and the model quietly gets worse. Fixes:
 
-**Point-in-time correctness.** Training joins must use feature values *as they were at the event's timestamp*. Joining today's "customer risk score" onto last year's transactions leaks the future into training, producing a model that looks great offline and fails in production.
+- Define each feature **once** (in a feature platform or a shared library) and generate both versions from that definition.
+- **Save the features exactly as used** at decision time, and train on those.
 
-**Labels arrive late and biased.** Chargebacks and fraud confirmations arrive 30–90+ days after the transaction. Declined transactions have *no* outcome label at all, because you blocked them, which is selection bias. Mitigations: explicit label-maturity windows, a small randomized holdout that is scored but not acted upon (where regulation and risk appetite allow), and monitoring of score distributions for drift instead of waiting for labels.
+**Point-in-time correctness.** When building training data, use feature values *as they were at the time of each payment*. Joining today's "customer risk score" onto last year's payments lets the model peek into the future. It looks great in testing and fails in real use.
+
+**Labels arrive late and are biased.** A *label* is the answer "this was fraud" or "this was fine".
+
+- Chargebacks and fraud reports arrive 30–90+ days after the payment.
+- Payments you declined **never** get a label, because you stopped them (this is called *selection bias*).
+- Fixes: wait until labels are mature, keep a small random group that's scored but not acted on (only if rules and risk appetite allow), and watch for changes in score patterns instead of waiting for labels.
 
 ### Decisioning: rules + model + cost
 
@@ -3098,18 +3220,20 @@ flowchart LR
 
 *[Open full-size diagram: Fraud decision policy (SVG)](diagrams/m5-fraud-decision-policy.svg)*
 
-- **Rules** are explainable, instantly deployable and auditable. They handle known patterns, regulatory hard stops (sanctions hits) and emergency response ("block MCC 7995 from country X for 2 hours").
-- **Models** (gradient-boosted trees are still the workhorse, with sequence and graph models layered on) rank risk across hundreds of weak signals.
-- **Decision policy** maps `(score, rules fired, amount, customer segment)` to *approve*, *step-up* (3-D Secure, OTP, in-app confirmation), *decline* or *queue for review*. Choose thresholds on **expected cost**, not accuracy: `fraud_loss × P(fraud)` against `friction_cost × P(legit)`, where friction cost includes abandoned purchases and churned customers. Fraud is heavily imbalanced, so evaluate with precision–recall at operating points, not ROC-AUC alone.
-- **Reason codes** accompany every decline or step-up, for customer service, disputes and model governance.
+- **Rules** are easy to explain, quick to change and easy to audit. They handle known patterns, legal hard stops (sanctions matches), and emergencies ("block gambling merchants from country X for 2 hours").
+- **Models** (gradient-boosted trees are still the workhorse, with sequence and graph models added on top) rank risk using hundreds of small signals.
+- **The decision policy** combines score, rules, amount and customer type into: *approve*, *extra check* (3-D Secure, a one-time code, confirming in the app), *decline*, or *send for review*.
+  - Pick thresholds by **expected cost**, not accuracy: `fraud loss × chance of fraud` compared with `friction cost × chance it's legitimate`. Friction cost includes lost sales and customers who leave.
+  - Fraud is rare, so measure precision and recall at the threshold you'll actually use, not only overall scores such as ROC-AUC.
+- **Reason codes** go with every decline or extra check, for customer service, disputes and model reviews.
 
-**Failure policy.** If the scoring service is down, you must not stop authorizing cards. The standard approach is **fail-open to stand-in rules**: a static ruleset with conservative amount limits evaluated locally in the authorization service, plus an alert. Fail-closed is reserved for narrow cases such as sanctions screening. Decide this with the business *in advance* and test it.
+**When the scoring service fails.** You must not stop approving card payments. The usual approach is **"let it through" with backup rules**: a simple, strict rule set that runs locally in the payment service, with lower amount limits and an alert. Blocking everything is only for narrow cases such as sanctions screening. Agree this with the business *before* it happens, and test it.
 
-**AML is a different problem.** Transaction monitoring for anti-money-laundering has longer horizons (days to months), typologies such as structuring and layering, case management and regulatory reporting (in Canada, suspicious-transaction reports to FINTRAC). It shares the streaming and feature infrastructure but has its own models, audit and governance requirements. Don't let a fraud platform be the AML system by accident.
+**AML is a different problem.** Anti-money-laundering monitoring looks over days to months, at patterns like splitting deposits to stay under limits. It involves case management and reports to regulators (in Canada, suspicious-transaction reports to FINTRAC). It can share the streaming and feature tools, but it needs its own models, audits and governance. Don't let a fraud system become the AML system by accident.
 
-## 5.2 Python in Practice
+## 5.2 Python
 
-### Inline scoring service: deadline budget, idempotent inline velocity, stand-in fallback
+### Inline scoring: time budget, safe-to-repeat counters, backup rules
 
 ```python
 import asyncio
@@ -3218,13 +3342,13 @@ async def score(req: AuthRequest) -> dict:
             "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
 ```
 
-Design notes:
+Notes on the design:
 
-- The thresholds shown are placeholders. Real thresholds come from expected-cost analysis per segment and are **configuration, versioned and audited**, not code constants.
-- A sorted set per *merchant* would be too heavy for merchants with thousands of authorizations per second. Use bucketed counters (one key per second, summed over the window) for high-volume entities.
-- The decision event (request, features as served, score, decision, model version) is published asynchronously for case management, monitoring and training. Losing it must not block the authorization, so use a local durable buffer.
+- The thresholds shown are examples. Real ones come from cost analysis per customer group, and are **settings that are versioned and audited**, not constants in code.
+- A sorted set per *merchant* is too heavy for merchants with thousands of payments per second. For those, use one counter per second and add up the last N counters.
+- The decision record (request, features used, score, decision, model version) is published in the background for case management, monitoring and training. Losing it must not block the payment, so buffer it locally on disk.
 
-### Near-real-time feature pipeline: an exactly-once Kafka transform
+### Near-real-time features: an exactly-once Kafka step
 
 ```python
 import json
@@ -3281,37 +3405,44 @@ while True:
 
 Caveats:
 
-- `offsets` should hold the *highest* offset per partition. The list above works because the broker takes the last value per partition, but deduplicating it is cleaner.
-- A separate sink consumer writes `card-features` to the online feature store (Redis, Cosmos DB) with **idempotent upserts keyed by entity and event version**. That hop is outside the Kafka transaction.
-- Check that your broker supports Kafka transactions. Apache Kafka, Confluent and MSK do. On Azure, confirm the current Event Hubs Kafka-transaction support for your tier before relying on it.
-- For richer windowing (watermarks, session windows, allowed lateness) in Python, use **PyFlink**, or a Python-native engine such as Bytewax or Quix Streams. Hand-rolled windowing in a consumer loop is where subtle event-time bugs live.
+- `offsets` should contain the *highest* offset per partition. The list above works because Kafka keeps the last value for each partition, but removing duplicates first is cleaner.
+- A separate consumer copies `card-features` into the online feature store (Redis, Cosmos DB) with **upserts keyed by entity and version**, so repeats are harmless. That step is outside the Kafka transaction.
+- Check that your broker supports Kafka transactions. Apache Kafka, Confluent and MSK do. On Azure, check current Event Hubs support for Kafka transactions on your tier before relying on it.
+- For proper windows (watermarks, session windows, late data) in Python, use **PyFlink**, Bytewax or Quix Streams. Home-made windowing inside a consumer loop is where subtle time bugs hide.
 
 ## 5.3 Case Study: Real-Time Card Fraud for a Card Issuer
 
-**Scenario:** an issuer with 30M active cards. 5,000 authorizations/s on average and 20,000/s at peak (Black Friday, the holiday season). The scoring decision has a p99 budget of ~30 ms, inside a network authorization timeout measured in seconds but shared with many other hops. Key threats: **card testing** (bots validating stolen card numbers with small authorizations at weak merchants), account takeover followed by card-not-present spending, and cross-border counterfeit.
+**Scenario:** a card issuer with 30 million active cards. There are 5,000 card payments per second on average and 20,000 per second at peak (Black Friday, holidays). The scoring decision gets ~30 ms for 99% of payments, because the card network allows a few seconds in total but many other steps share that time. The main threats:
 
-### Capacity math
+- **card testing:** bots checking stolen card numbers with small payments at weak merchants;
+- **account takeover** followed by online spending;
+- **cloned cards** used abroad.
 
-| Quantity | Estimate |
+### Rough numbers
+
+| What | Estimate |
 |---|---|
-| Inline Redis operations | ~3 per auth (two velocity scripts + one feature hash) → **60k ops/s at peak**. A small clustered cache handles this. The concern is p99, not throughput |
-| Online feature store size | 30M cards × ~40 features × ~16 B ≈ 20 GB, plus merchant, device and IP entities → tens of GB in memory |
-| Stream throughput | 20k events/s × ~1.5 KB (auth plus enrichment) ≈ 30 MB/s into the stream processor |
-| Decision log | ~400M decisions/day × ~2 KB ≈ **0.8 TB/day**. It is the training set, so keep it in the lakehouse |
-| Freshness SLO | Inline short-window counters: **0 lag** (updated in the path). Stream features: p99 under 2 s. Batch graph features: daily |
+| Redis calls in the payment path | ~3 per payment → **60,000 per second at peak**. A small Redis cluster handles that. The concern is the slowest 1%, not total throughput |
+| Online feature store size | 30M cards × ~40 features × ~16 bytes ≈ 20 GB, plus merchant, device and IP data → tens of GB in memory |
+| Stream volume | 20,000 events/s × ~1.5 KB ≈ 30 MB/s into the stream processor |
+| Decision log | ~400M decisions/day × ~2 KB ≈ **0.8 TB/day**. This is the training data, so keep it in the data lake |
+| Freshness targets | Short-window counters in the payment path: **no delay**. Stream features: 99% within 2 s. Batch relationship features: daily |
 
-### Architecture decisions
+### Design decisions
 
-- **Two feature freshness classes, deliberately.** Short-window velocity counters update inline, which catches card-testing bursts. Everything expensive (24 h windows, baselines, distinct counts, merchant compromise scores) comes from the stream.
-- **A merchant-level detector for card testing.** The signal is *many distinct cards* doing *small authorizations* at *one merchant or terminal*, with a high decline ratio. A 1-minute hopping window per merchant publishes a `merchant_under_attack` flag. The inline path reads it, and every card at that merchant gets stricter thresholds within seconds.
-- **The model registry and shadow scoring.** New models run in **shadow mode**: scored on live traffic, logged, not acted upon. They are promoted only after they outperform the champion at the chosen operating point. This is a parallel run (Module 6) applied to models.
-- **Case management and feedback.** Review-queue outcomes, customer confirmations ("was this you?") and chargebacks flow back as labels, joined point-in-time with the features as served.
-- **Explainability and governance.** Reason codes on every adverse decision. A model risk-management trail: data lineage, validation reports, versioned thresholds, and a record of who changed what.
-- **Failure policy.** Scoring unavailable means stand-in rules with lower limits. The feature store unavailable means stand-in rules. The stream processor lagging means inline counters still work, with an alert on the freshness SLO.
+- **Two freshness levels, on purpose.** Short-window counters are updated in the payment path and catch card-testing bursts. Everything expensive (24 h windows, normal behaviour, distinct counts, merchant risk) comes from the stream.
+- **A merchant-level detector for card testing.** The sign is *many different cards* making *small payments* at *one merchant*, with many declines. A 1-minute sliding window per merchant sets a `merchant_under_attack` flag. The payment path reads it, so every card at that merchant faces stricter limits within seconds.
+- **Testing new models safely.** New models first run in **shadow mode**: they score live payments and are logged, but their decisions aren't used. They replace the current model only if they do better at the chosen threshold. This is the parallel-run idea from Module 6, applied to models.
+- **Learning from outcomes.** Review results, customer answers ("was this you?") and chargebacks flow back as labels, joined to the features as they were at the time.
+- **Explaining decisions.** Every declined payment gets reason codes. There is a model review trail: data history, test reports, versioned thresholds, and who changed what.
+- **When parts fail:**
+  - Scoring down → backup rules with lower limits.
+  - Feature store down → backup rules.
+  - Stream processor behind → in-path counters still work, and an alert fires on the freshness target.
 
-**Azure mapping:** Event Hubs (Kafka endpoint) for the event backbone. Azure Stream Analytics for simple windows, or Flink on AKS / HDInsight on AKS for stateful features. Azure Cache for Redis Enterprise or Cosmos DB as the online feature store. Azure Machine Learning for the registry and training. Fabric or Databricks as the lakehouse for the decision log and batch features.
+**Azure services:** Event Hubs (Kafka API) for events. Azure Stream Analytics for simple windows, or Flink on AKS for complex state. Azure Cache for Redis Enterprise or Cosmos DB as the online feature store. Azure Machine Learning for the model registry and training. Fabric or Databricks as the data lake for the decision log and batch features.
 
-## 5.4 Mermaid: Real-Time Fraud Architecture
+## 5.4 Diagram: Real-Time Fraud Architecture
 
 ```mermaid
 flowchart LR
@@ -3350,34 +3481,34 @@ flowchart LR
 
 *[Open full-size diagram: Real-time fraud architecture (SVG)](diagrams/m5-real-time-fraud-architecture.svg)*
 
-## 5.5 Animation Blueprint: Catching a Card-Testing Attack Before the Stream Does
+## 5.5 Animation Plan: Catching a Card-Testing Attack Before the Stream Does
 
-**Scene setup:**
+**Scene:**
 
-- **Top:** a horizontal event-time axis with a moving "now" cursor.
-- **Middle-left:** a merchant storefront icon labelled *Merchant M-481*.
-- **Middle-right:** two counter panels side by side: *Inline counter (0 lag)* and *Stream counter (1.5 s lag)*.
-- **Bottom:** a decision gauge with three zones: green *approve*, amber *step-up*, red *decline*.
-- A watermark marker (a dashed vertical line) trails the "now" cursor on the axis.
+- **Top:** a timeline with a moving "now" marker.
+- **Middle left:** a shop icon labelled *Merchant M-481*.
+- **Middle right:** two counters side by side: *In-path counter (no delay)* and *Stream counter (1.5 s behind)*.
+- **Bottom:** a decision meter with three zones: green *approve*, amber *extra check* and red *decline*.
+- A dashed watermark line follows behind the "now" marker.
 
-| Time | Beat | Visual | Manim primitives |
+| Time | Step | What you see | Manim tools |
 |---|---|---|---|
-| 0:00–0:04 | **Normal traffic** | Sparse coloured dots (distinct cards) arrive at the merchant: a few per second, varied amounts. Both counters sit low and agree | `Dot` spawns on a timer, `DecimalNumber` |
-| 0:04–0:07 | **Attack starts** | A bot icon appears. A dense stream of *tiny* ($1.00–$2.00) authorizations from many *different* card colours fires at the merchant | `LaggedStart` of fast `MoveAlongPath` |
-| 0:07–0:12 | **The freshness gap** | The inline counter jumps with every event. The stream counter keeps showing old values, and a shaded band labelled *processing lag* stretches between event time and the stream's view. Caption: *Stream features are 1.5 s behind the burst* | `always_redraw` band, two counters with different updaters |
-| 0:12–0:15 | **Inline catch** | For a card hit repeatedly, its 10-minute inline velocity crosses 8. The gauge needle swings into amber: *STEP-UP*. A small 3-D Secure prompt icon appears | `Rotate(needle)`, `FadeIn` |
-| 0:15–0:20 | **Stream catches up** | The watermark passes the burst. A 1-minute hopping window above the axis fills: *distinct cards 212, avg amount $1.40, decline ratio 71%*. The window closes and emits a red `merchant_under_attack` flag that flies to the feature store | `Rectangle` window sliding, `Transform`, `MoveToTarget` |
-| 0:20–0:24 | **Merchant-wide tightening** | Every new authorization at M-481 now reads the flag. The gauge threshold marker slides left, and the bot's next attempts land in red: *DECLINE* | `threshold.animate.shift(LEFT)`, red `Flash` |
-| 0:24–0:29 | **Late event** | A dot with an older event time arrives *behind* the watermark (an offline terminal). It routes to a side lane labelled *allowed lateness → window updated*. The closed window re-opens briefly and its count ticks up by one | `ArcBetweenPoints` path, `Indicate` |
-| 0:29–0:33 | **Recap** | Two columns: *Inline: fast, narrow, per-card* and *Stream: complete, cross-entity, slightly late*. Caption: *You need both* | `VGroup.arrange(RIGHT)` |
+| 0:00–0:04 | **Normal traffic** | A few coloured dots (different cards) arrive at the shop each second, with varied amounts. Both counters are low and agree | Dots spawned on a timer, `DecimalNumber` |
+| 0:04–0:07 | **Attack starts** | A bot icon appears and fires a dense stream of *tiny* ($1–2) payments from many *different* cards | Fast `LaggedStart` of paths |
+| 0:07–0:12 | **The freshness gap** | The in-path counter jumps with every payment. The stream counter still shows old numbers, and a shaded band labelled *processing delay* stretches between them. Caption: *Stream features are 1.5 s behind the burst* | `always_redraw` band, two counters |
+| 0:12–0:15 | **Caught in the path** | For a card used again and again, its 10-minute counter passes 8. The meter swings to amber: *EXTRA CHECK*. A 3-D Secure prompt icon appears | Rotating needle, `FadeIn` |
+| 0:15–0:20 | **The stream catches up** | The watermark passes the burst. A 1-minute window above the timeline fills: *212 different cards, average $1.40, 71% declined*. The window closes and sends a red `merchant_under_attack` flag to the feature store | Sliding rectangle, `Transform`, `MoveToTarget` |
+| 0:20–0:24 | **Merchant-wide tightening** | Every new payment at M-481 now reads the flag. The threshold marker slides left, and the bot's next tries land in red: *DECLINE* | Threshold shift, red `Flash` |
+| 0:24–0:29 | **Late event** | A dot with an older time arrives *after* the watermark (a card terminal that was offline). It goes to a side lane: *late data → window updated*. The closed window briefly reopens and its count goes up by one | Curved path, `Indicate` |
+| 0:29–0:33 | **Summary** | Two columns: *In-path: fast, narrow, per card* and *Stream: complete, cross-merchant, slightly late*. Caption: *You need both* | `VGroup.arrange` |
 
-## 5.6 Staff-level Review Questions
+## 5.6 Review Questions
 
-- Which features does the inline path read, and what is each one's worst-case staleness at p99?
-- How are the same feature definitions guaranteed to match between training and serving?
-- What happens to authorizations, precisely, when the scoring service is unavailable, and when was that last tested?
-- How are decision thresholds chosen, versioned and approved, and who can change them in an emergency?
-- How does the platform measure performance on transactions that were declined and therefore never got a label?
+- Which features does the payment path read, and how out of date can each one be in the worst 1% of cases?
+- How do you make sure a feature is calculated the same way in training and in production?
+- Exactly what happens to payments when the scoring service is down, and when did you last test it?
+- How are thresholds chosen, versioned and approved, and who can change them in an emergency?
+- How do you measure how the model does on payments you declined, which never get a label?
 
 ---
 
@@ -3385,17 +3516,17 @@ flowchart LR
 
 *Industry: Core Banking Modernization*
 
-## 6.1 Core Theory & Trade-offs
+## 6.1 Ideas & Trade-offs
 
-### Why migrations of systems of record are different
+### Why replacing a bank's core system is different
 
-Replacing a core banking platform (for example, moving deposits off a mainframe COBOL/DB2 core onto a cloud-native ledger like Module 1's) is among the highest-risk changes a bank makes:
+Replacing a core banking system, for example moving deposits off an old mainframe (COBOL/DB2) onto a modern cloud ledger like the one in Module 1, is one of the riskiest changes a bank can make:
 
-- The system has decades of undocumented behaviour: interest rounding quirks, fee waivers coded for one product in 1998, cut-off time conventions.
-- It runs periodic processes that only execute at month-end, quarter-end or year-end.
-- A wrong balance is not a bug report. It is a regulatory event and a customer-trust event.
+- The old system has decades of **undocumented behaviour**: rounding quirks, a fee waiver coded for one product in 1998, particular cut-off times.
+- Some processes run **only at month-end, quarter-end or year-end**, so you may not see them for months.
+- A wrong balance isn't just a bug. It's a **regulatory problem** and a **trust problem**.
 
-"Big-bang" core migrations have failed publicly. The UK's TSB migration in 2018 is the widely studied example. The patterns in this module exist to **replace one large, irreversible leap with many small, verified, reversible steps**.
+"Big-bang" migrations (switching everything at once) have failed publicly. The UK bank TSB's 2018 migration is the best-known example. The patterns in this module replace **one big, irreversible jump with many small, checked steps that can be undone**.
 
 ### The migration pattern family
 
@@ -3414,14 +3545,14 @@ flowchart LR
 
 | Pattern | What it does | When to use | Main risk |
 |---|---|---|---|
-| **Strangler fig** | Route one capability at a time to the new system behind a façade | Decomposable functionality (statements, notifications, fee calculation) | Long tail of capabilities that are hard to extract |
-| **Branch by abstraction** | Introduce an interface inside the old code base, then swap the implementation | When you own the legacy code | Legacy code may be untouchable |
-| **Shadow traffic / dark launch** | Copy live requests to the new system and discard its responses | Read paths, calculations, APIs | Side effects leaking out of the shadow system |
-| **Parallel run** | Both systems process *the same inputs*. Outputs are compared. Legacy stays the system of record | Anything where correctness must be *proven*: balances, interest, fees | The cost of running two systems, and of triaging their differences |
-| **Reverse parallel** | After cutover, the **new** system is the system of record and legacy runs in shadow for a few cycles | To keep a rollback path | Needs a reverse data flow, and discipline about when it ends |
-| **Cohort cutover** | Move accounts or customers in waves: staff, then 1%, 10%, 50%, all | Almost always, as the cutover mechanism | Customers split across two systems (joint accounts, transfers between cohorts) |
+| **Strangler fig** | A front layer sends one feature at a time to the new system | Features that can be separated (statements, notifications, fee calculations) | Some features are very hard to pull out |
+| **Branch by abstraction** | Add an interface inside the old code, then swap what's behind it | When you can change the old code | The old code may be untouchable |
+| **Shadow traffic** | Copy live requests to the new system and ignore its answers | Read-only features, calculations, APIs | The shadow system accidentally sending real emails or payments |
+| **Parallel run** | Both systems process *the same inputs*, and their outputs are compared. The old system stays in charge | When correctness must be *proven*: balances, interest, fees | Running two systems costs money, and investigating differences takes time |
+| **Reverse parallel** | After switching, the **new** system is in charge and the old one runs alongside for a few cycles | To keep a way back | Needs data flowing back to the old system, and discipline about when to stop |
+| **Cohort cutover** | Move accounts in groups: staff first, then 1%, 10%, 50% and 100% of customers | Almost always, as the way to switch | Customers split across two systems (joint accounts, transfers between groups) |
 
-For a core ledger these are **combined, not chosen between**: shadow for read APIs, parallel run for balances and batch processes, cohort cutover with reverse parallel for the switch.
+For a bank ledger you **combine** these: shadow traffic for read APIs, parallel run for balances and batch jobs, and cohort cutover with reverse parallel for the switch itself.
 
 ### Parallel run modes
 
@@ -3438,11 +3569,11 @@ flowchart LR
 
 *[Open full-size diagram: Parallel run modes over time (SVG)](diagrams/m6-parallel-run-modes-over-time.svg)*
 
-1. **Mirror (shadow) run.** The new system consumes a copy of every input and builds its own state. Nothing it produces leaves the building. Its outputs (balances, postings, interest accruals) are compared with legacy's.
-2. **Full parallel run, including batch.** The new system also runs end-of-day, month-end interest capitalization, fee assessment and statement generation, and those outputs are compared too. Minimum duration is **at least one full quarter, including a month-end and quarter-end**. If tax reporting is in scope (in Canada, T5 slips for interest income), a year-end.
-3. **Reverse parallel.** After a cohort moves, the new system is authoritative. Its changes flow back to legacy so that legacy stays current, and legacy's outputs are compared in the other direction. Rollback remains possible until the declared **point of no return**.
+1. **Mirror run.** The new system receives a copy of every input and builds its own balances. Nothing it produces leaves the building. Its outputs (balances, postings, interest) are compared with the old system's.
+2. **Full parallel run.** The new system also runs end-of-day jobs, month-end interest, fees and statements, and those are compared too. **At minimum run for one full quarter, including a month-end and a quarter-end.** If tax reporting is involved (in Canada, T5 slips for interest income), include a year-end.
+3. **Reverse parallel.** After a group of accounts moves, the new system is in charge. Its changes flow back to the old system so the old one stays up to date, and outputs are compared in the other direction. You can still go back, until the declared **point of no return**.
 
-### The integration point: capture inputs, don't dual-write
+### The integration point: capture inputs, don't write to both
 
 ```mermaid
 flowchart LR
@@ -3464,16 +3595,16 @@ flowchart LR
 
 *[Open full-size diagram: Dual-write vs ordered input log (SVG)](diagrams/m6-dual-write-vs-ordered-input-log.svg)*
 
-**Dual-writing from channels to both systems is the classic mistake.** With no distributed transaction, a write that succeeds on one side and fails on the other diverges silently. Retries arrive in different orders. The systems then disagree for reasons that have nothing to do with their logic, and the diff triage team drowns in noise.
+**Writing to both systems from each channel ("dual-write") is the classic mistake.** There's no shared transaction, so a write can succeed on one side and fail on the other. Retries arrive in different orders. The systems then disagree for reasons that have nothing to do with their logic, and the team investigating differences drowns in noise.
 
-**Principal answer: make an ordered input log the integration point.**
+**Better: use one ordered list of inputs (a log) that both systems read.**
 
-- Capture every input that changes state (payments, deposits, card postings, account maintenance, rate changes) **into a durable ordered log** (Kafka/Event Hubs), in the order legacy processed it.
-- Legacy remains the system of record and processes inputs as it always has. The capture is either **before** it (channels publish to the log, and a legacy adapter consumes) or **after** it via CDC from legacy's database (e.g. Db2 log-based capture).
-- The new system consumes **the same log in the same order**, so it is deterministic by construction. Given the same starting state and the same inputs, a correct new system must produce the same outputs.
-- **Capturing after legacy's commit order is usually safer.** The log then reflects what legacy *actually* did, including its rejections, instead of what the channels asked for.
+- Record every input that changes data (payments, deposits, card transactions, account changes, rate changes) **in a durable ordered log** (Kafka or Event Hubs), in the order the old system processed them.
+- The old system stays in charge and works as always. Inputs are captured either **before** it (channels publish to the log and an adapter feeds the old system) or **after** it, by reading its database changes (CDC, for example log-based capture on Db2).
+- The new system reads **the same log in the same order**. With the same starting data and the same inputs, a correct new system must produce the same results.
+- **Capturing after the old system's commits is usually safer.** The log then shows what the old system *actually did*, including rejections, not just what channels asked for.
 
-### Why outputs differ, and why that is the whole job
+### Why the outputs differ, and why sorting that out is the whole job
 
 ```mermaid
 flowchart LR
@@ -3497,20 +3628,20 @@ flowchart LR
 
 *[Open full-size diagram: Diff classification pipeline (SVG)](diagrams/m6-diff-classification-pipeline.svg)*
 
-Most differences are not defects in the new system. Classify every difference into one of these buckets:
+Most differences aren't bugs in the new system. Sort every difference into one of these buckets:
 
-| Class | Example | Handling |
+| Kind of difference | Example | What to do |
 |---|---|---|
-| **Non-deterministic noise** | Generated IDs, timestamps, correlation IDs | Exclude or normalize before comparison |
-| **Representation** | Padding, case, date formats, sign conventions (debit negative vs. separate DR/CR columns) | Normalize, carefully |
-| **Precision and rounding** | Banker's rounding (half-even) vs. half-up. Accruing interest at 5 decimal places vs. rounding daily to cents | Compare at the contractual precision. **Never hide sub-cent accrual differences**, because they compound over a year |
-| **Convention** | Day-count basis (Actual/365 vs. Actual/360 vs. 30/360), leap years, business-date vs. calendar-date cut-offs, time zones | Encode the legacy convention explicitly. An intentional change is a product decision |
-| **Timing** | A transaction posted just after a cut-off on one side and just before on the other | Mark as *timing* and re-compare after the next cycle. It must resolve itself, or it becomes a break |
-| **Known differences** | An approved intentional change, or a legacy bug you've decided not to reproduce | A rule with a ticket, an owner and an expiry date |
-| **Data migration defects** | A wrong opening balance or product mapping for migrated accounts | Fix the migration and reload that account |
-| **Genuine breaks** | Anything else | Triage, root-cause, fix, re-run |
+| **Random noise** | Generated IDs, timestamps, tracking IDs | Ignore or normalize before comparing |
+| **Format** | Padding, upper/lower case, date formats, signs (negative debits vs. separate DR/CR columns) | Normalize, carefully |
+| **Rounding and precision** | Banker's rounding (half-even) vs. normal rounding (half-up). Interest kept to 5 decimals vs. rounded to cents daily | Compare at the precision the product contract uses. **Never hide sub-cent interest differences**, because they grow over a year |
+| **Conventions** | How days are counted (Actual/365, Actual/360, 30/360), leap years, business date vs. calendar date, time zones | Write the old system's rule down explicitly. Changing it on purpose is a product decision |
+| **Timing** | A payment just after a cut-off on one side and just before it on the other | Mark as *timing* and check again after the next cycle. It must sort itself out, or it becomes a break |
+| **Known differences** | An approved change, or an old bug you decided not to copy | A rule with a ticket, an owner and an expiry date |
+| **Data migration errors** | Wrong opening balance or product mapping for migrated accounts | Fix the migration and reload that account |
+| **Real breaks** | Anything else | Investigate, find the cause, fix it, re-run |
 
-The **diff platform is a product**: a store of every difference with its class, trend dashboards, drill-down to the inputs that produced it, and assignment to owners. Exit criteria are defined on it.
+The **difference tracker is a product in its own right**: it stores every difference with its type, shows trends, lets you drill down to the inputs behind it, and assigns an owner. The rules for finishing the migration are defined using it.
 
 ### Side-effect isolation (egress sandboxing)
 
@@ -3528,13 +3659,13 @@ flowchart LR
 
 *[Open full-size diagram: Egress adapter modes (SVG)](diagrams/m6-egress-adapter-modes.svg)*
 
-The new system in a parallel run must **never** emit real side effects: no payments to clearing, no files to card networks, no customer emails or SMS, no credit bureau updates. Put every egress behind an adapter with three modes:
+During a parallel run, the new system must **never** do anything real: no payments to clearing, no files to card networks, no customer emails or texts, no credit bureau updates. Put every outgoing connection behind an adapter with three modes:
 
-- **Record** (parallel run): capture what *would* have been sent, for comparison with what legacy actually sent.
-- **Live** (after cutover).
+- **Record** (during the parallel run): save what *would* have been sent, to compare with what the old system really sent.
+- **Live** (after switching).
 - **Block** (the default).
 
-Test the sandbox itself. A misconfigured adapter that sends duplicate payments during a "harmless" shadow run is a real incident.
+Test the blocking too. A misconfigured adapter that sends duplicate payments during a "harmless" shadow run is a real incident.
 
 ### Cutover, rollback and the point of no return
 
@@ -3556,22 +3687,26 @@ flowchart LR
 
 *[Open full-size diagram: Cohort cutover with rollback (SVG)](diagrams/m6-cohort-cutover-with-rollback.svg)*
 
-- **Routing.** An account-level **routing directory** (the same idea as Module 4's tenant directory) says which system is authoritative for each account, with an **epoch** that fences stale writers.
-- **Cohort flip.** Briefly freeze the cohort's inputs, confirm both systems agree for those accounts, flip the directory entries (incrementing the epoch), enable reverse sync, and resume.
-- **Relationships across cohorts.** Joint accounts, sweeps and overdraft links between accounts must move together. Build a **dependency graph** of accounts and migrate connected components.
-- **Rollback.** While reverse sync runs and reverse-parallel comparisons are clean, rollback means flipping the directory back. Define the **point of no return** explicitly: the moment legacy stops being kept current (for example, legacy licence termination or schema decommissioning). Past it, recovery means fixing forward.
+- **Routing.** An account-level **routing directory**, like the customer directory in Module 4, says which system is in charge of each account, with an **epoch** that blocks old writers.
+- **Switching a group:**
+  1. Briefly pause that group's inputs.
+  2. Confirm both systems agree for those accounts.
+  3. Switch their directory entries and increase the epoch.
+  4. Turn on reverse sync, and continue.
+- **Linked accounts.** Joint accounts, automatic transfers (sweeps) and overdraft links must move together. Map which accounts are connected, and move each connected group as one.
+- **Going back.** While reverse sync is running and comparisons are clean, going back just means switching the directory back. Decide the **point of no return** explicitly: the moment the old system stops being kept up to date (for example, when its licence ends). After that, you can only fix forward.
 
-### Exit criteria (example)
+### Rules for finishing (example)
 
-- N consecutive business days (commonly 20 or more) with **zero unexplained breaks** on balances and postings.
-- Month-end and quarter-end batch outputs matched, including interest capitalization and fees.
-- Performance at production volume with headroom (batch windows met, online p99 met).
-- Every known-difference rule approved by the product owner, with customer-impact assessment.
-- Reconciliation to the general ledger clean. Regulators or auditors briefed, as your jurisdiction requires.
+- At least 20 business days in a row with **zero unexplained differences** in balances and postings.
+- Month-end and quarter-end results matched, including interest and fees.
+- Performance at full volume with spare room (batch jobs finish in time, and online requests are fast enough).
+- Every known-difference rule approved by the product owner, with the customer impact assessed.
+- The general ledger reconciles cleanly, and regulators or auditors have been briefed if required.
 
-## 6.2 Python in Practice
+## 6.2 Python
 
-### A comparator: normalize, compare at contractual precision, classify
+### A comparator: clean up, compare at the right precision, and sort differences
 
 ```python
 from __future__ import annotations
@@ -3661,12 +3796,12 @@ def compare_account(
     return diffs
 ```
 
-The design choices are deliberate:
+Why it's built this way:
 
-- **Known differences expire.** Otherwise the rule set becomes a permanent place to hide defects.
-- **Timing differences must resolve.** A companion job re-compares yesterday's timing diffs and escalates any that persist to *break*.
-- **Compare canonical outputs, not screens.** Use a common schema for balances, postings and accruals, produced by an adapter on each side. The legacy adapter is often the hardest code in the programme.
-- **Scale:** 4M accounts × a few dozen fields per day is a straightforward partitioned batch job (Spark, or Python workers partitioned by account range). For the intraday posting stream, run the comparison in streaming mode, keyed by account and ordered by input sequence number.
+- **Known-difference rules expire.** Otherwise they become a permanent place to hide bugs.
+- **Timing differences must sort themselves out.** A companion job re-checks yesterday's timing differences and turns any that remain into *breaks*.
+- **Compare a common format, not screens.** Both sides produce balances, postings and interest in one shared layout, using an adapter on each side. The adapter for the old system is often the hardest code in the whole programme.
+- **Scale:** 4M accounts × a few dozen fields per day is a straightforward batch job, split by account range (Spark, or Python workers). For postings during the day, compare in streaming mode, grouped by account and ordered by input sequence number.
 
 ### A shadow tap for read APIs and pure calculations
 
@@ -3713,39 +3848,39 @@ class ShadowTap:
                 self.dropped += 1
 ```
 
-In the handler, the legacy call happens first and its response is returned. Only then does the handler call `tap.fire(...)`. The caller never waits on, and is never affected by, the new system. Track `dropped` as a metric, because a shadow run that silently samples 2% of traffic proves far less than it appears to.
+In the request handler, call the old system first and return its answer. Only then call `tap.fire(...)`. The caller never waits for the new system and is never affected by it. Track `dropped` as a metric: a shadow run that quietly samples only 2% of traffic proves much less than it seems.
 
-## 6.3 Case Study: Migrating Retail Deposits Off a Mainframe Core
+## 6.3 Case Study: Moving Retail Deposits Off a Mainframe
 
-**Scenario:** a mid-size Canadian bank with 4M retail deposit accounts (chequing, savings, GICs) on a mainframe core with nightly batch (interest accrual, fee assessment, statements) and a nightly general-ledger feed. The target is a cloud-native ledger built on the Module 1 design. Constraints: no customer-visible downtime beyond a short planned window per cohort, and the ability to roll back each cohort.
+**Scenario:** a mid-size Canadian bank with 4 million retail deposit accounts (chequing, savings, GICs) on a mainframe with nightly batch jobs (interest, fees, statements) and a nightly general-ledger feed. The target is a cloud ledger built like Module 1. Limits: no customer-visible downtime beyond a short planned window per group, and the ability to move each group back.
 
-### Programme phases
+### Project phases
 
-| Phase | What happens | Exit gate |
+| Phase | What happens | Done when |
 |---|---|---|
-| **0. Capture** | Build the ordered input log from legacy (CDC on the core database plus the channel feeds). Build canonical output adapters for both systems. Stand up the diff platform | The log replays a historical day on legacy's own data and reproduces its end-of-day balances |
-| **1. Initial load** | Snapshot migration of accounts, balances, holds, rates and product mappings into the new ledger. The CDC stream catches it up. Build the legacy-to-new **ID crosswalk** | Opening balances reconcile for 100% of accounts, and the total reconciles to the GL |
-| **2. Mirror run** | The new ledger consumes the live input log and builds balances intraday. Daily balance and posting comparisons | Break rate falling. All diff classes understood |
-| **3. Full parallel** | The new system also runs EOD, month-end and quarter-end batch processes. Compare interest, fees, statements (as documents *and* data) and the GL feed | 20+ clean business days, including month-end and quarter-end, and the batch window met at volume |
-| **4. Cohort cutover** | Employees' accounts first, then 1%, 5%, 25%, 100%, moving connected components of related accounts together. Flip the routing directory (with epoch). Reverse sync to legacy | Each cohort clean in reverse parallel for 2+ cycles before the next one moves |
-| **5. Point of no return** | Declare the end of reverse sync once all cohorts are stable through a month-end | Sign-off by product, risk, finance and technology |
-| **6. Decommission** | Archive legacy data under retention policy, keeping read access for audit and disputes | Records management and audit sign-off |
+| **0. Capture** | Build the ordered input log from the old system (CDC on its database plus channel feeds). Build output adapters for both systems. Set up the difference tracker | Replaying a past day on the old system's own data reproduces its end-of-day balances |
+| **1. Initial load** | Copy accounts, balances, holds, rates and product mappings into the new ledger, then let CDC catch up. Build the **ID mapping table** (old account number → new ID) | Opening balances match for 100% of accounts, and the total matches the general ledger |
+| **2. Mirror run** | The new ledger reads the live input log and builds balances during the day. Balances and postings are compared daily | The break rate keeps falling, and every kind of difference is understood |
+| **3. Full parallel** | The new system also runs end-of-day, month-end and quarter-end jobs. Interest, fees, statements (as documents *and* data) and the general-ledger feed are compared | 20+ clean business days including month-end and quarter-end, and batch jobs finish in time at full volume |
+| **4. Switch groups** | Staff accounts first, then 1%, 5%, 25% and 100%, moving linked accounts together. Switch the routing directory (with epoch) and turn on reverse sync | Each group is clean in reverse parallel for 2+ cycles before the next one moves |
+| **5. Point of no return** | Declare the end of reverse sync once all groups are stable through a month-end | Product, risk, finance and technology all sign off |
+| **6. Shut down the old system** | Archive old data under retention rules, keeping read access for audits and disputes | Records management and audit sign off |
 
-### Capacity and effort realities
+### Size and effort
 
-- **Daily comparison volume:** 4M accounts × ~30 canonical fields ≈ 120M field comparisons per day, plus intraday postings (say 20M/day). That is a routine partitioned batch job, *but the triage load is the real constraint*. Even a 0.01% break rate means 400 account-level breaks per day to explain.
-- **The break-rate curve** typically falls steeply in the first weeks (normalization and convention fixes), plateaus (real business-logic gaps), then spikes at the first month-end (batch processes seen for the first time). Plan staffing around that shape.
-- **Cost of running two systems:** budget for months of dual infrastructure and licensing. Shortening parallel run to save money is the most common way these programmes take on unpriced risk.
+- **Daily comparisons:** 4M accounts × ~30 fields ≈ 120 million field comparisons a day, plus ~20 million postings. That's a routine batch job, **but investigating differences is the real bottleneck**. Even a 0.01% break rate means 400 accounts a day to explain.
+- **How the break rate usually moves:** it drops fast in the first weeks (formatting and rounding fixes), then flattens (real logic gaps), then jumps at the first month-end (batch jobs seen for the first time). Plan staff around that shape.
+- **Cost of running two systems:** budget for months of double infrastructure and licences. Cutting the parallel run short to save money is the most common way these projects take on hidden risk.
 
-### Architecture decisions
+### Design decisions
 
-- **Legacy remains the system of record until each cohort flips.** Everything else is a derived view.
-- **Account-level routing directory** with epochs, used by channels (online banking, branch, payments hub) to route writes. It is cached, highly available, and changed only by the cutover orchestrator.
-- **Reverse sync after cutover:** the new ledger's postings, published through its outbox, are applied to legacy by an adapter, so legacy stays current for rollback and reverse-parallel comparison.
-- **Egress adapters in record mode** for every external interface: clearing, card networks, statements, notifications, the credit bureau, and the regulatory reporting feeds.
-- **Governance:** a known-difference board with product and risk owners, and customer-impact assessment for every intentional behaviour change. An interest calculation that is "more correct" in the new system can still change what a customer is paid, so treat it as a product change with customer communication.
+- **The old system stays in charge until each group switches.** Everything else is a copy.
+- **An account-level routing directory** with epochs, which every channel (online banking, branch, payments) uses to send writes to the right system. It's cached, always available, and changed only by the cutover tool.
+- **Reverse sync after switching.** The new ledger's postings, published through its outbox, are applied to the old system by an adapter. That keeps the old system current for going back and for reverse comparisons.
+- **Every outgoing connection in "record" mode** during the parallel run: clearing, card networks, statements, notifications, the credit bureau and regulatory reports.
+- **Governance:** a known-difference board with product and risk owners, and a customer-impact review for every intentional change. An interest calculation that is "more correct" in the new system still changes what customers are paid, so treat it as a product change and tell customers.
 
-## 6.4 Mermaid: Parallel-Run Architecture
+## 6.4 Diagram: Parallel-Run Architecture
 
 ```mermaid
 flowchart LR
@@ -3782,7 +3917,7 @@ flowchart LR
 
 *[Open full-size diagram: Parallel-run architecture (SVG)](diagrams/m6-parallel-run-architecture.svg)*
 
-And the lifecycle of a single account through the migration:
+The journey of one account through the migration:
 
 ```mermaid
 stateDiagram-v2
@@ -3800,68 +3935,68 @@ stateDiagram-v2
 
 *[Open full-size diagram: Account migration lifecycle (SVG)](diagrams/m6-account-migration-lifecycle.svg)*
 
-## 6.5 Animation Blueprint: Two Systems, One Input Stream, and a Reversible Cutover
+## 6.5 Animation Plan: Two Systems, One Input Stream, and a Switch You Can Undo
 
-**Scene setup:**
+**Scene:**
 
-- **Left:** a vertical input log drawn as a conveyor belt of numbered input cards (`#1041 DEPOSIT $250`, `#1042 FEE $5`...).
-- **Two horizontal lanes to the right:** top lane *Legacy core* (a grey mainframe icon), bottom lane *New ledger* (a blue cloud icon). Each lane has its own account balance card for account `CHQ-7781`.
-- **Far right:** a *Comparator* gate between the lanes, with a traffic-light indicator.
-- **Above everything:** a *Routing directory* card showing `CHQ-7781 → LEGACY, epoch 4`.
-- **Bottom strip:** a diff-rate sparkline.
+- **Left:** a conveyor belt of numbered input cards (`#1041 DEPOSIT $250`, `#1042 FEE $5`...).
+- **Two lanes on the right:** the top lane is the *Old core* (a grey mainframe icon), and the bottom lane is the *New ledger* (a blue cloud icon). Each lane shows the balance for account `CHQ-7781`.
+- **Far right:** a *Comparator* gate between the lanes, with a traffic light.
+- **Above everything:** a *Routing directory* card showing `CHQ-7781 → OLD, epoch 4`.
+- **Bottom:** a small chart of the difference rate.
 
-| Time | Beat | Visual | Manim primitives |
+| Time | Step | What you see | Manim tools |
 |---|---|---|---|
-| 0:00–0:05 | **Same inputs, same order** | Input cards leave the belt and **split**: identical copies travel down both lanes in lockstep. Both balance cards update to the same values. The comparator light is green | `TransformFromCopy`, synchronized `MoveAlongPath` |
-| 0:05–0:09 | **The dual-write counterexample** (inset) | A small inset replays the wrong design: a channel writes to both systems directly, one write fails, and a retry arrives out of order. The balances diverge by $5. Caption: *Dual-write: divergence you can't explain* | Inset `Rectangle`, red `Cross`, `Wiggle` |
-| 0:09–0:14 | **A rounding diff** | Month-end interest: the legacy card shows `accrued 1.23456 → paid 1.23`, and the new one shows `accrued 1.23457 → paid 1.23`. The comparator light turns amber, and a diff chip `accrued_interest Δ 0.00001` pops out. It is stamped **BREAK**, then routed to a triage desk icon | `Indicate`, `FadeIn(chip)`, `MoveToTarget` |
-| 0:14–0:18 | **Root cause** | The triage desk zooms in: *legacy uses half-up on daily accrual; new uses half-even*. The fix is applied to the new lane (the half-even label becomes half-up). A re-run shows the numbers match and the light is green | `Transform`, `Circumscribe` |
-| 0:18–0:22 | **A timing diff** | Input `#1090 POS $42` arrives at 23:59:58. Legacy posts it to *today*, and the new system to *tomorrow* (a business-date cut-off mismatch). The diff chip is stamped **TIMING**. The next day the chip auto-resolves and fades | Date badges, `FadeOut(chip)` after a clock advance |
-| 0:22–0:26 | **Clean streak** | The sparkline falls toward zero. A counter shows *clean business days: 1 → 23* ticking up, and a month-end marker passes with the light green | `ChangeDecimalToValue`, `ValueTracker` |
-| 0:26–0:31 | **Cutover** | The input belt pauses (*freeze*). The directory card flips to `CHQ-7781 → NEW, epoch 5`. The lanes swap emphasis: the new lane brightens as the system of record, and the legacy lane dims to *shadow*. A reverse-sync arrow appears from new to legacy | `Transform(directory)`, `set_opacity`, `GrowArrow` |
-| 0:31–0:35 | **Fencing** | A delayed write from an old channel session arrives stamped `epoch 4`. It is rejected at the directory with *stale epoch* | Red `Flash`, the arrow shatters |
-| 0:35–0:40 | **Rollback rehearsal** | A red *ROLLBACK* button is pressed. The directory flips back to `LEGACY, epoch 6`. Because reverse sync kept legacy current, both balance cards still match. Caption: *Reversible, because legacy never fell behind* | `Transform`, green light |
-| 0:40–0:44 | **Point of no return** | The reverse-sync arrow is cut. The legacy lane greys out and moves into an *Archive* box. Caption: *Declare it deliberately, never by accident* | `FadeOut`, `MoveToTarget(archive)` |
+| 0:00–0:05 | **Same inputs, same order** | Input cards leave the belt and **split**. Identical copies travel down both lanes together, both balances update to the same values, and the comparator light is green | `TransformFromCopy`, synchronized paths |
+| 0:05–0:09 | **Why not dual-write?** (side panel) | A small panel replays the wrong design: a channel writes to both systems directly, one write fails, and a retry arrives out of order. The balances end up $5 apart. Caption: *Dual-write: differences you can't explain* | Inset box, red `Cross`, `Wiggle` |
+| 0:09–0:14 | **A rounding difference** | Month-end interest: the old system shows `accrued 1.23456 → paid 1.23` and the new one `accrued 1.23457 → paid 1.23`. The light turns amber. A tag `accrued_interest Δ 0.00001` pops out, is stamped **BREAK**, and goes to an investigation desk | `Indicate`, `FadeIn`, `MoveToTarget` |
+| 0:14–0:18 | **Root cause** | The desk zooms in: *the old system rounds daily interest half-up, the new one half-even*. The new lane's rule is fixed, the re-run matches, and the light turns green | `Transform`, `Circumscribe` |
+| 0:18–0:22 | **A timing difference** | Input `#1090 POS $42` arrives at 23:59:58. The old system counts it as *today* and the new one as *tomorrow* (a cut-off mismatch). The tag is stamped **TIMING**. The next day it sorts itself out and fades away | Date badges, `FadeOut` after the clock moves |
+| 0:22–0:26 | **Clean streak** | The chart falls toward zero. A counter shows *clean business days: 1 → 23*, and a month-end marker passes with the light still green | Counting numbers |
+| 0:26–0:31 | **Switch** | The belt pauses (*freeze*). The directory card flips to `CHQ-7781 → NEW, epoch 5`. The new lane brightens (now in charge) and the old lane dims (*shadow*). A reverse-sync arrow appears from new to old | `Transform`, `set_opacity`, `GrowArrow` |
+| 0:31–0:35 | **Fencing** | A late write from an old channel session arrives stamped `epoch 4`. The directory rejects it: *old epoch* | Red `Flash`, arrow breaks |
+| 0:35–0:40 | **Rollback practice** | A red *ROLLBACK* button is pressed. The directory flips back to `OLD, epoch 6`. Because reverse sync kept the old system current, both balances still match. Caption: *You can undo it, because the old system never fell behind* | `Transform`, green light |
+| 0:40–0:44 | **Point of no return** | The reverse-sync arrow is cut. The old lane turns grey and moves into an *Archive* box. Caption: *Decide this on purpose, never by accident* | `FadeOut`, `MoveToTarget` |
 
-## 6.6 Staff-level Review Questions
+## 6.6 Review Questions
 
-- What is the single integration point that guarantees both systems see the same inputs in the same order?
-- Which external side effects could the new system emit during parallel run, and how is each one proven blocked?
-- Which periodic processes (month-end, quarter-end, year-end, rate changes, leap day) have actually been observed in parallel run, rather than assumed?
-- How are joint and linked accounts kept together across cohort boundaries?
-- What exactly must be true to roll back a cohort, and when does that stop being possible?
+- What single point guarantees that both systems see the same inputs in the same order?
+- Which real-world actions could the new system trigger during the parallel run, and how do you prove each one is blocked?
+- Which periodic jobs (month-end, quarter-end, year-end, rate changes, leap day) have you actually *seen* in the parallel run, rather than assumed?
+- How are joint and linked accounts kept together when groups move?
+- What exactly must be true to move a group back, and when does that stop being possible?
 
 ---
 
 # Epilogue — The Staff/Principal Design Review Checklist
 
-Across all four modules, the same questions separate senior designs from principal ones:
+These questions separate good designs from great ones in every module:
 
-1. **Where is the source of truth, and what enforces its invariants?** It should be a constraint or conditional write, not a lock or a cache.
-2. **Which operations are retried, and what makes each one idempotent?** Name the dedupe key and the transaction it commits in.
-3. **What number fences stale actors?** A version, term, epoch or LSN, checked by the component being written to.
-4. **What is the CP/AP choice per data type, and who signed off on it?**
-5. **What are the capacity numbers?** Show them via Little's Law, bytes per unit, and fan-out math, not "it scales horizontally".
-6. **What is the degradation ladder, and which user-visible behaviour does each rung produce?**
-7. **What bounds the blast radius?** Cells, bulkheads and per-dependency breakers.
-8. **How is correctness verified continuously in production?** Reconciliation jobs, invariant checks, golden-set evals.
-9. **How fresh is each input to a decision, and what happens when it isn't?** Know the staleness of every feature and replica on the critical path.
-10. **Can the change be reversed, and until when?** For migrations, models and schema changes, name the rollback mechanism and the point of no return.
+1. **Where is the real data, and what keeps it correct?** The answer should be a database rule or a conditional write, not a lock or a cache.
+2. **Which actions get retried, and what makes each one safe to repeat?** Name the duplicate-check key and the transaction it's saved in.
+3. **What number blocks old actors?** A version, term, epoch or log position, checked by the thing being written to.
+4. **For each type of data, did we choose consistency or availability, and who agreed?**
+5. **What are the actual numbers?** Show the maths (Little's Law, bytes per item, fan-out), not just "it scales".
+6. **What are the degradation steps, and what does the user see at each one?**
+7. **How far can one failure spread?** Cells, separate pools, one breaker per dependency.
+8. **How do we check correctness all the time in production?** Automatic reconciliation, rule checks, test question sets.
+9. **How fresh is each piece of data used in a decision, and what happens when it's stale?** Know how out of date every feature and replica on the critical path can be.
+10. **Can we undo this change, and until when?** For migrations, models and schema changes, name the undo method and the point of no return.
 
 ## Further reading
 
-These are well-known references for going deeper. Verify details against the current editions.
+These are well-known references for going deeper. Check details against the latest editions.
 
 - Martin Kleppmann, *Designing Data-Intensive Applications*.
 - Diego Ongaro and John Ousterhout, "In Search of an Understandable Consensus Algorithm" (the Raft paper).
-- Martin Kleppmann, "How to do distributed locking" (the Redlock critique), and Salvatore Sanfilippo's response.
+- Martin Kleppmann, "How to do distributed locking" (the Redlock criticism), and Salvatore Sanfilippo's reply.
 - Yu. A. Malkov and D. A. Yashunin, the HNSW paper ("Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs").
 - Kwon et al., the vLLM / PagedAttention paper.
 - Das, Gupta and Motivala, the SWIM membership protocol paper.
 - Mohan et al., the ARIES recovery paper.
 - Lamping and Veach, "A Fast, Minimal Memory, Consistent Hash Algorithm" (jump hash).
-- Google SRE book chapters on handling overload and addressing cascading failures.
+- The Google SRE book chapters on handling overload and avoiding cascading failures.
 - Tyler Akidau et al., "The Dataflow Model" paper, and the book *Streaming Systems*.
 - Carbone et al., "Lightweight Asynchronous Snapshots for Distributed Dataflows" (Flink checkpointing).
-- Martin Fowler, "StranglerFigApplication" and related articles on legacy displacement.
+- Martin Fowler, "StranglerFigApplication" and related articles on replacing legacy systems.
 - The independent review of the 2018 TSB migration, for a detailed account of a big-bang core migration failure.
